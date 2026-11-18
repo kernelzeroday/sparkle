@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use futures_util::StreamExt;
 use sparkle_core::prefill::PrefillFilter;
-use sparkle_core::{ChatRequest, Provider, StreamEvent, Usage};
+use sparkle_core::{ChatRequest, PromptProgress, Provider, StreamEvent, Usage};
 use sparkle_tui::anim;
 
 const CLEAR_LINE: &str = "\r\x1b[2K";
@@ -34,16 +34,22 @@ struct Spinner {
     enabled: bool,
     visible: bool,
     frame: u64,
+    /// Set while a local server is reading the prompt.
+    progress: Option<PromptProgress>,
 }
 
 impl Spinner {
+    fn label(&self) -> String {
+        self.progress.map_or_else(|| "Thinking".to_string(), |progress| progress.label())
+    }
+
     fn tick(&mut self) {
         if !self.enabled {
             return;
         }
         self.frame += 1;
         self.visible = true;
-        eprint!("{CLEAR_LINE}{} Thinking", anim::spinner(self.frame));
+        eprint!("{CLEAR_LINE}{} {}", anim::spinner(self.frame), self.label());
         let _ = std::io::stderr().flush();
     }
 
@@ -69,7 +75,8 @@ pub async fn stream_reply(
     let mut filter = PrefillFilter::new(render.prefill.unwrap_or(""));
     let started = Instant::now();
     let stderr_is_terminal = std::io::stderr().is_terminal();
-    let mut spinner = Spinner { enabled: stderr_is_terminal, visible: false, frame: 0 };
+    let mut spinner =
+        Spinner { enabled: stderr_is_terminal, visible: false, frame: 0, progress: None };
     let mut outcome = Outcome::default();
     let mut ticker = tokio::time::interval(Duration::from_millis(80));
     let mut stdout = std::io::stdout();
@@ -107,7 +114,14 @@ pub async fn stream_reply(
             }
         };
         match event {
+            StreamEvent::PromptProgress(progress) => {
+                if outcome.reasoning.is_empty() && outcome.text.is_empty() {
+                    spinner.progress = Some(progress);
+                }
+            }
             StreamEvent::Reasoning(text) => {
+                // With reasoning hidden the spinner keeps running, now for the model's thinking.
+                spinner.progress = None;
                 outcome.reasoning.push_str(&text);
                 if !render.hide_reasoning {
                     spinner.stop();
@@ -149,4 +163,18 @@ pub async fn stream_reply(
     }
     outcome.duration_ms = started.elapsed().as_millis() as u64;
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_spinner_shows_prefill_progress_when_it_has_some() {
+        let mut spinner = Spinner { enabled: false, visible: false, frame: 0, progress: None };
+        assert_eq!(spinner.label(), "Thinking");
+        spinner.progress =
+            Some(PromptProgress { processed: 83_000, total: 197_000, cache: 0, time_ms: 9 });
+        assert_eq!(spinner.label(), "Prefilling 42% (83k/197k)");
+    }
 }

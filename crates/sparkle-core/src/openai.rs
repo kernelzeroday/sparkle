@@ -1,6 +1,8 @@
 //! OpenAI-compatible `/chat/completions` provider (OpenAI, llama.cpp, Ollama, vLLM and others).
 
 use std::collections::VecDeque;
+use std::net::IpAddr;
+use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -10,8 +12,12 @@ use serde_json::{Value, json};
 
 use crate::sse::SseDecoder;
 use crate::{
-    Attachment, ChatRequest, Error, EventStream, Message, Provider, Result, Role, StreamEvent, Usage,
+    Attachment, ChatRequest, Error, EventStream, Message, PromptProgress, Provider, Result, Role,
+    StreamEvent, Usage,
 };
+
+/// How long a local server gets to report its context size.
+const PROPS_TIMEOUT: Duration = Duration::from_millis(1500);
 
 pub struct OpenAiCompat {
     client: reqwest::Client,
@@ -27,6 +33,69 @@ impl OpenAiCompat {
             api_key,
         }
     }
+
+    fn host(&self) -> Option<String> {
+        reqwest::Url::parse(&self.base_url).ok()?.host_str().map(str::to_string)
+    }
+
+    fn is_openai(&self) -> bool {
+        self.host().is_some_and(|host| host == "openai.com" || host.ends_with(".openai.com"))
+    }
+
+    /// The body to send. Streams elsewhere ask for prefill progress, which llama-server reports.
+    fn wire_body(&self, request: &ChatRequest) -> Value {
+        let mut body = request_body(request);
+        if request.stream
+            && !self.is_openai()
+            && let Some(map) = body.as_object_mut()
+        {
+            // An explicit `-o return_progress false` turns this off.
+            map.entry("return_progress").or_insert(json!(true));
+        }
+        body
+    }
+
+    /// Where llama-server publishes its settings, which sit beside the `/v1` API.
+    fn props_url(&self) -> String {
+        format!("{}/props", self.base_url.strip_suffix("/v1").unwrap_or(&self.base_url))
+    }
+
+    async fn fetch_context_window(&self) -> Option<u64> {
+        if !self.host().is_some_and(|host| is_local_host(&host)) {
+            return None;
+        }
+        let mut builder = self.client.get(self.props_url()).timeout(PROPS_TIMEOUT);
+        if let Some(key) = &self.api_key {
+            builder = builder.bearer_auth(key);
+        }
+        let response = builder.send().await.ok()?.error_for_status().ok()?;
+        parse_context_window(&response.text().await.ok()?)
+    }
+}
+
+/// True for hosts on this machine or the local network.
+fn is_local_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(address) = host.parse::<IpAddr>() {
+        return match address.to_canonical() {
+            IpAddr::V4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+            IpAddr::V6(ip) => {
+                let first = ip.segments()[0];
+                ip.is_loopback() || first & 0xfe00 == 0xfc00 || first & 0xffc0 == 0xfe80
+            }
+        };
+    }
+    let host = host.to_ascii_lowercase();
+    host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local")
+}
+
+/// Reads the context size from a llama-server `/props` response.
+fn parse_context_window(data: &str) -> Option<u64> {
+    let value: Value = serde_json::from_str(data).ok()?;
+    value["default_generation_settings"]["n_ctx"]
+        .as_u64()
+        .or_else(|| value["n_ctx"].as_u64())
+        .filter(|size| *size > 0)
 }
 
 /// Encodes an attachment the way the chat completions API expects for its type.
@@ -106,6 +175,20 @@ fn usage_event(value: &Value) -> Option<StreamEvent> {
     }))
 }
 
+fn prompt_progress_event(value: &Value) -> Option<StreamEvent> {
+    let progress = value.get("prompt_progress").filter(|progress| progress.is_object())?;
+    let field = |name: &str| progress[name].as_u64().unwrap_or(0);
+    let total = field("total");
+    (total > 0).then(|| {
+        StreamEvent::PromptProgress(PromptProgress {
+            processed: field("processed"),
+            total,
+            cache: field("cache"),
+            time_ms: field("time_ms"),
+        })
+    })
+}
+
 fn error_message(value: &Value) -> Option<String> {
     let error = value.get("error").filter(|error| !error.is_null())?;
     Some(error["message"].as_str().map_or_else(|| error.to_string(), str::to_string))
@@ -121,7 +204,7 @@ pub fn parse_chunk(data: &str) -> Result<Vec<StreamEvent>> {
     if let Some(message) = error_message(&value) {
         return Err(Error::Stream(message));
     }
-    let mut events = Vec::new();
+    let mut events: Vec<StreamEvent> = prompt_progress_event(&value).into_iter().collect();
     if let Some(choice) = value["choices"].get(0) {
         let delta = &choice["delta"];
         if let Some(text) = text_field(delta, &["reasoning_content", "reasoning"]) {
@@ -232,7 +315,7 @@ impl Provider for OpenAiCompat {
                 .client
                 .post(url)
                 .header("content-type", "application/json")
-                .body(request_body(request).to_string());
+                .body(self.wire_body(request).to_string());
             if let Some(key) = &self.api_key {
                 builder = builder.bearer_auth(key);
             }
@@ -252,6 +335,10 @@ impl Provider for OpenAiCompat {
             let events = parse_response(&response.text().await?)?;
             Ok(Box::pin(stream::iter(events.into_iter().map(Ok))) as EventStream)
         })
+    }
+
+    fn context_window(&self) -> BoxFuture<'_, Option<u64>> {
+        Box::pin(self.fetch_context_window())
     }
 }
 
@@ -347,6 +434,114 @@ mod tests {
             parse_chunk(usage).unwrap(),
             vec![StreamEvent::Usage(Usage { input_tokens: 11, output_tokens: 7 })]
         );
+    }
+
+    #[test]
+    fn parses_prompt_progress() {
+        let chunk = r#"{"choices":[],"prompt_progress":{"total":53,"cache":4,"processed":20,"time_ms":50}}"#;
+        let progress = PromptProgress { processed: 20, total: 53, cache: 4, time_ms: 50 };
+        assert_eq!(parse_chunk(chunk).unwrap(), vec![StreamEvent::PromptProgress(progress)]);
+    }
+
+    #[test]
+    fn prompt_progress_comes_before_text_in_the_same_chunk() {
+        let chunk = r#"{"choices":[{"delta":{"content":"hi"}}],"prompt_progress":{"total":2,"processed":2}}"#;
+        let events = parse_chunk(chunk).unwrap();
+        assert!(matches!(events[0], StreamEvent::PromptProgress(_)));
+        assert_eq!(events[1], StreamEvent::Text("hi".into()));
+    }
+
+    #[test]
+    fn unusable_prompt_progress_is_ignored() {
+        for chunk in [
+            r#"{"choices":[],"prompt_progress":null}"#,
+            r#"{"choices":[],"prompt_progress":"soon"}"#,
+            r#"{"choices":[],"prompt_progress":{"total":0,"processed":0}}"#,
+        ] {
+            assert_eq!(parse_chunk(chunk).unwrap(), vec![], "{chunk}");
+        }
+    }
+
+    #[test]
+    fn progress_labels_show_percent_and_cache() {
+        let progress = PromptProgress { processed: 83_000, total: 197_000, cache: 0, time_ms: 0 };
+        assert_eq!(progress.percent(), 42);
+        assert_eq!(progress.label(), "Prefilling 42% (83k/197k)");
+        let cached = PromptProgress { cache: 12_000, ..progress };
+        assert_eq!(cached.label(), "Prefilling 42% (83k/197k), 12k cached");
+    }
+
+    #[test]
+    fn progress_percent_stays_in_range() {
+        let almost = PromptProgress { processed: 999, total: 1000, ..Default::default() };
+        assert_eq!(almost.percent(), 99);
+        let over = PromptProgress { processed: 12, total: 10, ..Default::default() };
+        assert_eq!(over.percent(), 100);
+        assert_eq!(PromptProgress::default().percent(), 0);
+        let huge = PromptProgress { processed: u64::MAX, total: u64::MAX, ..Default::default() };
+        assert_eq!(huge.percent(), 100);
+    }
+
+    #[test]
+    fn only_streams_to_other_servers_ask_for_progress() {
+        let local = OpenAiCompat::new("http://127.0.0.1:8080/v1", None);
+        assert_eq!(local.wire_body(&request())["return_progress"], true);
+
+        let mut whole = request();
+        whole.stream = false;
+        assert!(local.wire_body(&whole).get("return_progress").is_none());
+
+        for url in ["https://api.openai.com/v1", "https://API.OpenAI.com/v1/"] {
+            let openai = OpenAiCompat::new(url, None);
+            assert!(openai.wire_body(&request()).get("return_progress").is_none(), "{url}");
+        }
+        let lookalike = OpenAiCompat::new("https://api.openai.com.example.org/v1", None);
+        assert_eq!(lookalike.wire_body(&request())["return_progress"], true);
+    }
+
+    #[test]
+    fn an_explicit_option_can_turn_progress_off() {
+        let mut request = request();
+        request.options.extra.insert("return_progress".into(), json!(false));
+        let local = OpenAiCompat::new("http://localhost:8080/v1", None);
+        assert_eq!(local.wire_body(&request)["return_progress"], false);
+    }
+
+    #[test]
+    fn props_sit_beside_the_versioned_api() {
+        let versioned = OpenAiCompat::new("http://localhost:8080/v1/", None);
+        assert_eq!(versioned.props_url(), "http://localhost:8080/props");
+        let bare = OpenAiCompat::new("http://localhost:8080", None);
+        assert_eq!(bare.props_url(), "http://localhost:8080/props");
+    }
+
+    #[test]
+    fn reads_the_context_size_from_props() {
+        let nested = r#"{"default_generation_settings":{"n_ctx":258000}}"#;
+        assert_eq!(parse_context_window(nested), Some(258_000));
+        assert_eq!(parse_context_window(r#"{"n_ctx":4096}"#), Some(4096));
+        assert_eq!(parse_context_window(r#"{"n_ctx":0}"#), None);
+        assert_eq!(parse_context_window("<html>not json</html>"), None);
+    }
+
+    #[test]
+    fn recognizes_local_hosts() {
+        for host in [
+            "localhost", "LOCALHOST", "box.local", "app.localhost", "127.0.0.1", "10.0.0.8",
+            "172.16.4.2", "192.168.1.20", "169.254.0.9", "[::1]", "[fd00::1]", "[fe80::1]",
+            "[::ffff:127.0.0.1]",
+        ] {
+            assert!(is_local_host(host), "{host}");
+        }
+        for host in ["api.openai.com", "8.8.8.8", "172.32.0.1", "[2001:db8::1]", "localhost.evil.io"] {
+            assert!(!is_local_host(host), "{host}");
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_servers_are_never_asked_for_props() {
+        let remote = OpenAiCompat::new("https://api.example.invalid/v1", Some("secret".into()));
+        assert_eq!(remote.context_window().await, None);
     }
 
     #[test]

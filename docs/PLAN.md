@@ -39,8 +39,8 @@ crates/
   sparkle         command line, plain streaming, packaging metadata
 ```
 
-Providers implement one trait that yields a stream of `Reasoning`, `Text`, `Usage` and `Finished`
-events. Both front ends consume the same stream.
+Providers implement one trait that yields a stream of `PromptProgress`, `Reasoning`, `Text`,
+`Usage` and `Finished` events. Both front ends consume the same stream.
 
 ## Feature map
 
@@ -90,7 +90,10 @@ Status: **done** works today, **partial** usable with gaps, **planned** has a mi
 | Copy code blocks with OSC 52 | M2 |
 | Pretty markdown for one-shot prompts on a terminal | M2 |
 | Compare models side by side | M7 |
-| Context meter and compaction | M7 |
+| Prefill progress and context meter for local `llama-server` | done |
+| Context meter for remote providers | M7 |
+| Context compaction with `/compact` and automatically (see [ROADMAP.md](ROADMAP.md)) | M7 |
+| Memory tools for models | after 1.0 (see [ROADMAP.md](ROADMAP.md)) |
 
 ## Tools and subagents
 
@@ -125,7 +128,7 @@ autonomous planning loop.
 | **M4 Providers** | OpenAI Responses, Anthropic and Gemini native streaming |
 | **M5 Tools** | Declarative tools, approval cards, tool logging, MCP client |
 | **M6 Embeddings** | `embed`, `embed-multi`, `similar`, `collections` |
-| **M7 Polish** | Compare view, context meter, theme files, accessibility pass, 1.0 packaging |
+| **M7 Polish** | Compare view, remote context meter, context compaction, theme files, accessibility pass, 1.0 packaging |
 
 ## Packaging
 

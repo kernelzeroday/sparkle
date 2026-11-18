@@ -29,6 +29,35 @@ fn opens_with_the_default_model_and_sends_a_message() {
     assert!(tui.raw().contains("Continue this conversation with: sparkle chat --cid"));
 }
 
+// Prefill progress and context
+
+#[test]
+fn prefill_progress_replaces_connecting_until_the_reply_starts() {
+    let harness = Harness::new();
+    no_smart_titles(&harness);
+    let mut tui = Tui::open(&harness, &[]);
+    tui.send("slowly prefill-progress\r");
+    tui.wait_for("Prefilling 50% (2k/4k), 1k cached");
+    tui.wait_for("Hello world");
+    tui.wait_gone("Prefilling");
+    assert_eq!(harness.last_body()["return_progress"], true);
+    tui.wait_gone("esc to stop");
+    tui.quit();
+}
+
+#[test]
+fn a_local_server_reports_its_context_size() {
+    let harness = Harness::new();
+    no_smart_titles(&harness);
+    let mut tui = Tui::open(&harness, &["-s", "Be brief"]);
+    tui.wait_for("Context window: 8k tokens");
+    tui.wait_for("sys ~2 tok (8 B)");
+    tui.wait_for("~2/8k (0%)");
+    tui.ask(&harness, "hello");
+    tui.wait_for("18/8k (0%)");
+    tui.quit();
+}
+
 // Window title
 
 #[test]

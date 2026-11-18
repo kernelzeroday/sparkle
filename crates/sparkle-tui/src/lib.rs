@@ -124,6 +124,7 @@ fn edit_in_editor(text: &str) -> io::Result<String> {
 /// Runs the chat until the user quits. Returns the conversation id, if one was saved.
 pub async fn run(session: ChatSession) -> io::Result<Option<String>> {
     let (mut app, mut receiver) = App::new(session);
+    app.request_context_window();
     let (mut terminal, enhanced) = enter_terminal()?;
     let mut input = InputThread::start();
     let mut ticker = tokio::time::interval(FRAME);

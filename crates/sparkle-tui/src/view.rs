@@ -1,6 +1,7 @@
 //! Drawing. Everything here reads application state and writes to a frame.
 
 use sparkle_core::Role;
+use sparkle_core::context::{compact_count, format_bytes, size_label, usage_label};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -132,9 +133,36 @@ fn render_turn(
     lines
 }
 
+fn fragment_bytes(app: &App) -> usize {
+    app.fragments.iter().map(String::len).sum()
+}
+
+/// What this chat will send before the first message, one fact per line.
+fn session_details(app: &App) -> Vec<String> {
+    let mut details = Vec::new();
+    if let Some(system) = &app.system {
+        let size = size_label(system.len());
+        details.push(match &app.persona {
+            Some(persona) => format!("System prompt: {persona}, {size}"),
+            None => format!("System prompt: {size}"),
+        });
+    }
+    if !app.fragments.is_empty() {
+        let label = attached_label(app.fragments.len());
+        details.push(format!("{label}: {}", size_label(fragment_bytes(app))));
+    }
+    if let Some(prefill) = &app.prefill {
+        details.push(format!("Prefill: {}", size_label(prefill.len())));
+    }
+    if let Some(window) = app.context_window {
+        details.push(format!("Context window: {} tokens", compact_count(window)));
+    }
+    details
+}
+
 fn draw_welcome(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let theme = &app.theme;
-    let lines = vec![
+    let mut lines = vec![
         Line::from(Span::styled(
             format!("{}  sparkle", app.icons.assistant),
             Style::new().fg(theme.accent).add_modifier(Modifier::BOLD),
@@ -149,6 +177,13 @@ fn draw_welcome(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::new().fg(theme.muted),
         )),
     ];
+    let details = session_details(app);
+    if !details.is_empty() {
+        lines.push(Line::default());
+    }
+    for detail in details {
+        lines.push(Line::from(Span::styled(detail, Style::new().fg(theme.heading))));
+    }
     let height = lines.len() as u16;
     let top = area.y + area.height.saturating_sub(height) / 2;
     let centered = Rect { y: top, height: height.min(area.height), ..area };
@@ -198,10 +233,11 @@ fn activity_line(app: &App) -> Line<'static> {
         return Line::from(Span::styled(format!(" {notice}"), Style::new().fg(theme.heading)));
     }
     if app.busy() {
-        let label = match app.phase {
-            Phase::Waiting => "Connecting",
-            Phase::Thinking => "Thinking",
-            _ => "Writing",
+        let label = match (app.phase, app.prompt_progress) {
+            (Phase::Waiting, Some(progress)) => progress.label(),
+            (Phase::Waiting, None) => "Connecting".to_string(),
+            (Phase::Thinking, _) => "Thinking".to_string(),
+            _ => "Writing".to_string(),
         };
         let mut spans = Vec::new();
         if app.animations {
@@ -209,7 +245,7 @@ fn activity_line(app: &App) -> Line<'static> {
                 format!(" {} ", anim::spinner(app.frame)),
                 Style::new().fg(theme.accent),
             ));
-            spans.extend(anim::shimmer(label, app.frame, theme.shimmer_low, theme.shimmer_high));
+            spans.extend(anim::shimmer(&label, app.frame, theme.shimmer_low, theme.shimmer_high));
         } else {
             spans.push(Span::styled(format!(" {} {label}", app.icons.thinking), muted));
         }
@@ -252,6 +288,26 @@ fn activity_line(app: &App) -> Line<'static> {
     Line::default()
 }
 
+/// Context usage and token totals, dropping the totals first when space is short.
+fn status_right(app: &App, room: usize) -> String {
+    let context = app.context_window.map(|window| {
+        let (used, estimated) = app.context_used();
+        usage_label(used, window, estimated)
+    });
+    let usage = app.total_usage;
+    let totals = (usage.input_tokens + usage.output_tokens > 0)
+        .then(|| format!("{} in · {} out", usage.input_tokens, usage.output_tokens));
+    let full = match (&context, &totals) {
+        (Some(context), Some(totals)) => format!("{context} · {totals} "),
+        (Some(text), None) | (None, Some(text)) => format!("{text} "),
+        (None, None) => String::new(),
+    };
+    match context {
+        Some(context) if full.width() >= room => format!("{context} "),
+        _ => full,
+    }
+}
+
 fn status_line(app: &App, width: u16) -> Line<'static> {
     let theme = &app.theme;
     let icons = &app.icons;
@@ -262,25 +318,25 @@ fn status_line(app: &App, width: u16) -> Line<'static> {
     )];
     let effort = app.options.effort.as_deref().unwrap_or("auto");
     left.push(Span::styled(format!("   {} {effort}", icons.effort), muted));
+    let heading = Style::new().fg(theme.heading);
     if let Some(persona) = &app.persona {
         left.push(Span::styled(format!("   {} {persona}", icons.persona), muted));
-    } else if app.system.is_some() {
-        left.push(Span::styled(format!("   {} custom", icons.persona), muted));
     }
-    if app.prefill.is_some() {
-        left.push(Span::styled("   prefill set", Style::new().fg(theme.heading)));
+    if let Some(system) = &app.system {
+        let icon = if app.persona.is_some() { String::new() } else { format!("{} ", icons.persona) };
+        left.push(Span::styled(format!("   {icon}sys {}", size_label(system.len())), heading));
+    }
+    if let Some(prefill) = &app.prefill {
+        let size = format_bytes(prefill.len());
+        left.push(Span::styled(format!("   prefill set ({size})"), heading));
     }
     if !app.fragments.is_empty() {
         let label = attached_label(app.fragments.len());
-        left.push(Span::styled(format!("   {label}"), Style::new().fg(theme.heading)));
+        let size = format_bytes(fragment_bytes(app));
+        left.push(Span::styled(format!("   {label} ({size})"), heading));
     }
-    let usage = app.total_usage;
-    let right = if usage.input_tokens + usage.output_tokens > 0 {
-        format!("{} in · {} out ", usage.input_tokens, usage.output_tokens)
-    } else {
-        String::new()
-    };
     let used: usize = left.iter().map(|span| span.content.width()).sum();
+    let right = status_right(app, usize::from(width).saturating_sub(used));
     let gap = usize::from(width).saturating_sub(used + right.width());
     if gap > 0 {
         left.push(Span::raw(" ".repeat(gap)));
@@ -310,7 +366,7 @@ mod tests {
     use super::*;
     use crate::app::tests::{app_with, drain, reply_events, type_text};
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-    use sparkle_core::StreamEvent;
+    use sparkle_core::{PromptProgress, StreamEvent};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -453,6 +509,129 @@ mod tests {
         let after = screen(&mut app, 80, 24);
         assert!(after.contains("▍ 1 file attached"), "{after}");
         assert!(!after.contains("HIDDENFILE"), "{after}");
+    }
+
+    fn text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|span| span.content.as_ref()).collect()
+    }
+
+    fn prefilling(app: &mut App, cache: u64) {
+        type_text(app, "hi");
+        enter(app);
+        app.prompt_progress =
+            Some(PromptProgress { processed: 83_000, total: 197_000, cache, time_ms: 40 });
+    }
+
+    #[tokio::test]
+    async fn activity_line_shows_prefill_progress_instead_of_connecting() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        prefilling(&mut app, 0);
+        let line = text(&activity_line(&app));
+        assert!(line.contains("Prefilling 42% (83k/197k)"), "{line}");
+        assert!(!line.contains("cached"), "{line}");
+        assert!(!line.contains("Connecting"), "{line}");
+        assert!(line.contains("esc to stop"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn activity_line_shows_cached_tokens() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        prefilling(&mut app, 12_000);
+        let line = text(&activity_line(&app));
+        assert!(line.contains("Prefilling 42% (83k/197k), 12k cached"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn activity_line_shows_prefill_progress_without_animations() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        app.animations = false;
+        prefilling(&mut app, 0);
+        assert!(text(&activity_line(&app)).contains("Prefilling 42%"));
+    }
+
+    #[tokio::test]
+    async fn status_line_shows_the_system_prompt_size() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        app.system = Some("x".repeat(813 * 1024));
+        let line = text(&status_line(&app, 100));
+        assert!(line.contains("sys ~208k tok (813 KB)"), "{line}");
+        assert!(!line.contains("custom"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn status_line_names_the_persona_beside_its_size() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        app.persona = Some("pirate".into());
+        app.system = Some("x".repeat(2048));
+        let line = text(&status_line(&app, 100));
+        assert!(line.contains("pirate   sys ~512 tok (2 KB)"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn status_line_shows_fragment_and_prefill_sizes() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        app.fragments = vec!["a".repeat(1024), "b".repeat(1024)];
+        app.prefill = Some("Hello".into());
+        let line = text(&status_line(&app, 100));
+        assert!(line.contains("2 files attached (2 KB)"), "{line}");
+        assert!(line.contains("prefill set (5 B)"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn status_line_shows_context_usage_when_the_window_is_known() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        assert!(!text(&status_line(&app, 100)).contains('%'));
+
+        app.context_window = Some(258_000);
+        prefilling(&mut app, 0);
+        let line = text(&status_line(&app, 100));
+        assert!(line.trim_end().ends_with("197k/258k (76%)"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn status_line_marks_estimated_context_usage() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        app.context_window = Some(1000);
+        app.system = Some("x".repeat(400));
+        let line = text(&status_line(&app, 100));
+        assert!(line.trim_end().ends_with("~100/1k (10%)"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn status_line_keeps_context_usage_when_totals_do_not_fit() {
+        let (mut app, mut receiver, _provider) = app_with(reply_events(), None);
+        app.context_window = Some(1000);
+        type_text(&mut app, "hi");
+        enter(&mut app);
+        drain(&mut app, &mut receiver).await;
+
+        let wide = text(&status_line(&app, 80));
+        assert!(wide.trim_end().ends_with("8/1k (0%) · 5 in · 3 out"), "{wide}");
+        let narrow = text(&status_line(&app, 30));
+        assert!(narrow.trim_end().ends_with("8/1k (0%)"), "{narrow}");
+    }
+
+    #[tokio::test]
+    async fn welcome_screen_stays_plain_without_extras() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        let screen = screen(&mut app, 80, 24);
+        assert!(!screen.contains("System prompt"), "{screen}");
+        assert!(!screen.contains("Context window"), "{screen}");
+    }
+
+    #[tokio::test]
+    async fn welcome_screen_lists_what_the_chat_will_send() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        app.persona = Some("pirate".into());
+        app.system = Some("x".repeat(2048));
+        app.fragments = vec!["y".repeat(1024)];
+        app.prefill = Some("Hello".into());
+        app.context_window = Some(258_000);
+        let screen = screen(&mut app, 100, 24);
+        assert!(screen.contains("System prompt: pirate, ~512 tok (2 KB)"), "{screen}");
+        assert!(screen.contains("1 file attached: ~256 tok (1 KB)"), "{screen}");
+        assert!(screen.contains("Prefill: ~2 tok (5 B)"), "{screen}");
+        assert!(screen.contains("Context window: 258k tokens"), "{screen}");
     }
 
     #[tokio::test]

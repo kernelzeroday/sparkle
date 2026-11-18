@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::context::compact_count;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -124,8 +126,39 @@ pub struct Usage {
     pub output_tokens: u64,
 }
 
+/// How far a local server has read into the prompt before its first token.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PromptProgress {
+    /// Tokens read so far, including those reused from the cache.
+    pub processed: u64,
+    pub total: u64,
+    /// Tokens reused from the server's prompt cache.
+    pub cache: u64,
+    pub time_ms: u64,
+}
+
+impl PromptProgress {
+    /// Whole percent complete, which only reaches 100 once every token is read.
+    pub fn percent(&self) -> u64 {
+        let processed = u128::from(self.processed.min(self.total));
+        (processed * 100 / u128::from(self.total.max(1))) as u64
+    }
+
+    /// Status text such as `Prefilling 42% (83k/197k), 12k cached`.
+    pub fn label(&self) -> String {
+        let processed = compact_count(self.processed.min(self.total));
+        let total = compact_count(self.total);
+        let mut label = format!("Prefilling {}% ({processed}/{total})", self.percent());
+        if self.cache > 0 {
+            label.push_str(&format!(", {} cached", compact_count(self.cache)));
+        }
+        label
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamEvent {
+    PromptProgress(PromptProgress),
     Reasoning(String),
     Text(String),
     Usage(Usage),

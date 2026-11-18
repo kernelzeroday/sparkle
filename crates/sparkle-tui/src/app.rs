@@ -5,10 +5,13 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
+use sparkle_core::context::estimate_tokens;
 use sparkle_core::personas;
 use sparkle_core::prefill::PrefillFilter;
 use sparkle_core::title;
-use sparkle_core::{ChatRequest, Message, Options, Provider, Role, StreamEvent, Usage};
+use sparkle_core::{
+    ChatRequest, Message, Options, PromptProgress, Provider, Role, StreamEvent, Usage,
+};
 use sparkle_store::{NewMessage, Store, StoredMessage};
 use ratatui::style::Style;
 use ratatui::text::Line;
@@ -107,6 +110,14 @@ impl Turn {
             format!("{}\n{}", self.context, self.text)
         }
     }
+
+    /// The size of `wire_text` in bytes.
+    fn wire_len(&self) -> usize {
+        match self.context.len() {
+            0 => self.text.len(),
+            context => context + 1 + self.text.len(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,6 +134,7 @@ pub enum Payload {
     Failed(String),
     Ended,
     Title(String),
+    ContextWindow(u64),
 }
 
 #[derive(Debug)]
@@ -180,6 +192,14 @@ pub struct App {
     pub show_reasoning: bool,
     pub scroll: usize,
     pub total_usage: Usage,
+    /// The server's latest report while it reads the prompt.
+    pub prompt_progress: Option<PromptProgress>,
+    /// The model's context size in tokens, when the server reports one.
+    pub context_window: Option<u64>,
+    context_epoch: u64,
+    context_task: Option<JoinHandle<()>>,
+    /// Tokens the server last counted, and how many turns that count covers.
+    measured_context: Option<(u64, usize)>,
     pub notice: Option<String>,
     pub dirty: bool,
     pub should_quit: bool,
@@ -259,6 +279,11 @@ impl App {
             show_reasoning: session.show_reasoning,
             scroll: 0,
             total_usage: Usage::default(),
+            prompt_progress: None,
+            context_window: None,
+            context_epoch: 0,
+            context_task: None,
+            measured_context: None,
             notice: None,
             dirty: true,
             should_quit: false,
@@ -283,6 +308,43 @@ impl App {
 
     pub fn busy(&self) -> bool {
         self.phase != Phase::Idle
+    }
+
+    /// Asks the current provider for its context size in the background.
+    pub fn request_context_window(&mut self) {
+        if let Some(task) = self.context_task.take() {
+            task.abort();
+        }
+        self.context_epoch += 1;
+        self.context_window = None;
+        let generation = self.context_epoch;
+        let provider = Arc::clone(&self.provider);
+        let sender = self.sender.clone();
+        self.context_task = Some(tokio::spawn(async move {
+            if let Some(size) = provider.context_window().await {
+                let payload = Payload::ContextWindow(size);
+                let _ = sender.send(StreamMessage { generation, payload });
+            }
+        }));
+    }
+
+    /// Tokens the next request will use, and whether that number is an estimate.
+    pub fn context_used(&self) -> (u64, bool) {
+        if let Some(progress) = self.prompt_progress {
+            return (progress.total, false);
+        }
+        let (measured, counted) = self.measured_context.unwrap_or((0, 0));
+        let mut pending: usize = self.turns[counted.min(self.turns.len())..]
+            .iter()
+            .filter(|turn| turn.role.is_some())
+            .map(Turn::wire_len)
+            .sum();
+        pending += self.fragments.iter().map(String::len).sum::<usize>();
+        pending += self.prefill.as_ref().map_or(0, String::len);
+        if self.measured_context.is_none() {
+            pending += self.system.as_ref().map_or(0, String::len);
+        }
+        (measured + estimate_tokens(pending), self.measured_context.is_none() || pending > 0)
     }
 
     pub fn on_terminal(&mut self, event: Event) {
@@ -445,6 +507,7 @@ impl App {
                 self.conversation_id = None;
                 self.reset_title();
                 self.total_usage = Usage::default();
+                self.measured_context = None;
                 self.notice = Some("Started a new conversation".into());
             }
             "/quit" | "/exit" => self.should_quit = true,
@@ -456,6 +519,8 @@ impl App {
                     self.model = model.id;
                     self.wire_model = model.wire_name;
                     self.provider = model.provider;
+                    self.measured_context = None;
+                    self.request_context_window();
                     self.notice = Some(format!("Switched to {}", self.model));
                 }
                 Err(error) => self.notice = Some(error),
@@ -478,6 +543,7 @@ impl App {
             "/system" => {
                 self.system = (!argument.is_empty()).then(|| argument.to_string());
                 self.persona = None;
+                self.measured_context = None;
                 self.notice = Some(
                     if self.system.is_some() { "System prompt set" } else { "System prompt cleared" }
                         .into(),
@@ -518,10 +584,12 @@ impl App {
         } else if name == "off" {
             self.persona = None;
             self.system = None;
+            self.measured_context = None;
             self.notice = Some("Persona cleared".into());
         } else if let Some(persona) = personas::find(name) {
             self.persona = Some(persona.name.to_string());
             self.system = Some(persona.prompt.to_string());
+            self.measured_context = None;
             self.notice = Some(format!("Persona: {}", persona.name));
         } else {
             self.notice = Some(format!("Unknown persona '{name}'"));
@@ -542,6 +610,7 @@ impl App {
             return;
         };
         self.turns.truncate(index);
+        self.measured_context = None;
         self.begin_reply();
     }
 
@@ -563,6 +632,7 @@ impl App {
         }
         turn.text = text;
         turn.cache = None;
+        self.measured_context = None;
         if let (Some(store), Some(conversation)) = (&self.store, conversation) {
             let message = NewMessage {
                 model: Some(&turn.model),
@@ -728,6 +798,7 @@ impl App {
         self.phase = Phase::Waiting;
         self.started = Some(Instant::now());
         self.first_reasoning = None;
+        self.prompt_progress = None;
         self.generation += 1;
 
         let generation = self.generation;
@@ -760,6 +831,13 @@ impl App {
             }
             return;
         }
+        if let Payload::ContextWindow(size) = message.payload {
+            if message.generation == self.context_epoch {
+                self.context_window = Some(size);
+                self.dirty = true;
+            }
+            return;
+        }
         if message.generation != self.generation || !self.busy() {
             return;
         }
@@ -773,7 +851,7 @@ impl App {
                 self.finish();
             }
             Payload::Ended => self.finish(),
-            Payload::Title(_) => {}
+            Payload::Title(_) | Payload::ContextWindow(_) => {}
         }
     }
 
@@ -782,24 +860,39 @@ impl App {
     }
 
     fn on_event(&mut self, event: StreamEvent) {
+        // Progress changes nothing in the transcript, so its rendered lines stay cached.
+        if let StreamEvent::PromptProgress(progress) = event {
+            if self.phase == Phase::Waiting {
+                self.prompt_progress = Some(progress);
+            }
+            return;
+        }
         let thought = Self::elapsed_ms(self.first_reasoning);
+        let counted = self.turns.len();
         let Some(turn) = self.turns.last_mut() else { return };
         turn.cache = None;
         match event {
+            StreamEvent::PromptProgress(_) => {}
             StreamEvent::Reasoning(text) => {
                 turn.reasoning.push_str(&text);
                 self.first_reasoning.get_or_insert_with(Instant::now);
                 self.phase = Phase::Thinking;
+                self.prompt_progress = None;
             }
             StreamEvent::Text(text) => {
                 turn.text.push_str(&self.reply_filter.push(&text));
                 turn.thought_ms = turn.thought_ms.or(thought);
                 self.phase = Phase::Writing;
+                self.prompt_progress = None;
             }
             StreamEvent::Usage(usage) => {
                 turn.usage = Some(usage);
                 self.total_usage.input_tokens += usage.input_tokens;
                 self.total_usage.output_tokens += usage.output_tokens;
+                if usage.input_tokens > 0 {
+                    let tokens = usage.input_tokens + usage.output_tokens;
+                    self.measured_context = Some((tokens, counted));
+                }
             }
             StreamEvent::Finished(_) => {}
         }
@@ -824,6 +917,7 @@ impl App {
         let thought = Self::elapsed_ms(self.first_reasoning);
         self.phase = Phase::Idle;
         self.started = None;
+        self.prompt_progress = None;
         self.task = None;
         self.dirty = true;
         let conversation = self.conversation_id.clone();
@@ -1279,6 +1373,102 @@ pub(crate) mod tests {
         let turn = app.turns.last().unwrap();
         assert_eq!(turn.text, "partial");
         assert!(turn.interrupted);
+    }
+
+    fn progress(processed: u64, total: u64) -> StreamEvent {
+        StreamEvent::PromptProgress(PromptProgress { processed, total, cache: 0, time_ms: 1 })
+    }
+
+    fn deliver(app: &mut App, event: StreamEvent) {
+        let generation = app.generation;
+        app.on_stream(StreamMessage { generation, payload: Payload::Event(event) });
+    }
+
+    #[tokio::test]
+    async fn prefill_progress_lasts_until_the_first_token() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        type_text(&mut app, "hi");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        deliver(&mut app, progress(10, 100));
+        deliver(&mut app, progress(50, 100));
+        assert_eq!(app.prompt_progress.unwrap().processed, 50);
+        assert_eq!(app.phase, Phase::Waiting);
+
+        deliver(&mut app, StreamEvent::Text("hello".into()));
+        assert_eq!(app.prompt_progress, None);
+        deliver(&mut app, progress(100, 100));
+        assert_eq!(app.prompt_progress, None, "late reports are ignored");
+    }
+
+    #[tokio::test]
+    async fn stopping_clears_prefill_progress() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        type_text(&mut app, "hi");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        deliver(&mut app, progress(10, 100));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.prompt_progress, None);
+    }
+
+    #[tokio::test]
+    async fn prefill_progress_keeps_the_rendered_transcript() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        type_text(&mut app, "hi");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        app.turns.last_mut().unwrap().cache = Some((80, true, Vec::new()));
+        deliver(&mut app, progress(10, 100));
+        assert!(app.turns.last().unwrap().cache.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_context_size_from_a_previous_model_is_discarded() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        app.request_context_window();
+        let stale = app.context_epoch;
+        app.request_context_window();
+        let current = app.context_epoch;
+        app.on_stream(StreamMessage { generation: stale, payload: Payload::ContextWindow(1) });
+        assert_eq!(app.context_window, None);
+        app.on_stream(StreamMessage { generation: current, payload: Payload::ContextWindow(2) });
+        assert_eq!(app.context_window, Some(2));
+    }
+
+    #[tokio::test]
+    async fn context_is_estimated_until_the_server_counts_it() {
+        let (mut app, mut receiver, _provider) = app_with(reply_events(), None);
+        app.system = Some("s".repeat(400));
+        app.fragments = vec!["f".repeat(40)];
+        assert_eq!(app.context_used(), (110, true));
+
+        type_text(&mut app, "hi");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        drain(&mut app, &mut receiver).await;
+        assert_eq!(app.context_used(), (8, false), "usage replaces the estimate");
+
+        app.prefill = Some("p".repeat(8));
+        assert_eq!(app.context_used(), (10, true), "unsent text is added to the count");
+    }
+
+    #[tokio::test]
+    async fn changing_the_conversation_drops_the_server_count() {
+        let (mut app, mut receiver, _provider) = app_with(reply_events(), None);
+        type_text(&mut app, "hi");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        drain(&mut app, &mut receiver).await;
+        assert!(!app.context_used().1);
+
+        type_text(&mut app, "/system Be brief");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.context_used().1);
+    }
+
+    #[tokio::test]
+    async fn prefill_reports_the_exact_prompt_size() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        type_text(&mut app, "hi");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        deliver(&mut app, progress(10, 5000));
+        assert_eq!(app.context_used(), (5000, false));
     }
 
     #[tokio::test]

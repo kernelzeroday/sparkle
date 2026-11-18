@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 
 pub const REPLY: &str = "Hello world\n\n```python\nprint('hi')\n```\n\n```sh\nls\n```";
 pub const GENERATED_TITLE: &str = "Mock chat title";
+pub const CONTEXT_SIZE: u64 = 8000;
 const WAIT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug)]
@@ -76,11 +77,16 @@ fn respond(stream: &mut std::net::TcpStream, recorded: &Recorded) {
         return;
     }
     let pause = Duration::from_millis(if text.contains("slowly") { 700 } else { 0 });
-    let parts = [
+    let mut parts = vec![
         sse(json!({ "reasoning_content": "Thinking hard" })),
         sse(json!({ "content": "Hello " })),
         sse(json!({ "content": "world\n\n```python\nprint('hi')\n```\n\n```sh\nls\n```" })),
     ];
+    if text.contains("prefill-progress") {
+        let progress = json!({ "total": 4000, "cache": 1000, "processed": 2000, "time_ms": 50 });
+        let chunk = json!({ "choices": [], "prompt_progress": progress });
+        parts.insert(0, format!("data: {chunk}\n\n"));
+    }
     for part in parts {
         if stream.write_all(part.as_bytes()).is_err() {
             return;
@@ -103,6 +109,8 @@ fn start_server(requests: Arc<Mutex<Vec<Recorded>>>) -> u16 {
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let mut length = 0;
                 let mut authorization = None;
+                let mut request_line = String::new();
+                let _ = reader.read_line(&mut request_line);
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
@@ -115,6 +123,11 @@ fn start_server(requests: Arc<Mutex<Vec<Recorded>>>) -> u16 {
                             _ => {}
                         }
                     }
+                }
+                if request_line.starts_with("GET /props") {
+                    let props = json!({ "default_generation_settings": { "n_ctx": CONTEXT_SIZE } });
+                    http_json(&mut stream, "200 OK", &props.to_string());
+                    return;
                 }
                 let mut bytes = vec![0; length];
                 reader.read_exact(&mut bytes).unwrap();
