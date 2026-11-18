@@ -1,0 +1,21 @@
+[package]
+name = "sparkle-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Domain types, configuration and model providers for sparkle"
+
+[dependencies]
+base64.workspace = true
+directories.workspace = true
+futures-util.workspace = true
+mime_guess.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_norway.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

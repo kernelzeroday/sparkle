@@ -1,0 +1,57 @@
+[package]
+name = "sparkle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+readme = "../../README.md"
+
+[[bin]]
+name = "sparkle"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+clap_mangen.workspace = true
+futures-util.workspace = true
+libc.workspace = true
+sparkle-core.workspace = true
+sparkle-store.workspace = true
+sparkle-tui.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+portable-pty = "0.9"
+vt100 = "0.16"
+
+[package.metadata.deb]
+name = "sparkle"
+section = "utils"
+priority = "optional"
+# Explicit so packages built on non-Debian hosts still declare their dependencies.
+depends = "libc6 (>= 2.39), libgcc-s1"
+maintainer = "sparkle contributors"
+copyright = "sparkle contributors"
+extended-description = "sparkle is a terminal-first chat and prompt tool for language models, with a full-screen chat interface and a pipe-friendly command line."
+assets = [
+    ["target/release/sparkle", "usr/bin/", "755"],
+    ["../../dist/assets/sparkle.1", "usr/share/man/man1/", "644"],
+    ["../../dist/assets/sparkle.bash", "usr/share/bash-completion/completions/sparkle", "644"],
+    ["../../dist/assets/_sparkle", "usr/share/zsh/vendor-completions/", "644"],
+    ["../../dist/assets/sparkle.fish", "usr/share/fish/vendor_completions.d/", "644"],
+    ["../../README.md", "usr/share/doc/sparkle/", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "sparkle"
+assets = [
+    { source = "target/release/sparkle", dest = "/usr/bin/sparkle", mode = "755" },
+    { source = "dist/assets/sparkle.1", dest = "/usr/share/man/man1/sparkle.1", mode = "644", doc = true },
+    { source = "dist/assets/sparkle.bash", dest = "/usr/share/bash-completion/completions/sparkle", mode = "644" },
+    { source = "dist/assets/_sparkle", dest = "/usr/share/zsh/site-functions/_sparkle", mode = "644" },
+    { source = "dist/assets/sparkle.fish", dest = "/usr/share/fish/vendor_completions.d/sparkle.fish", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/sparkle/README.md", mode = "644", doc = true },
+]

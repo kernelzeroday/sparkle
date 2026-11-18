@@ -1,0 +1,18 @@
+[package]
+name = "sparkle-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The full-screen chat interface for sparkle"
+
+[dependencies]
+crossterm.workspace = true
+futures-util.workspace = true
+sparkle-core.workspace = true
+sparkle-store.workspace = true
+pulldown-cmark.workspace = true
+ratatui.workspace = true
+ratatui-textarea.workspace = true
+syntect.workspace = true
+tokio.workspace = true
+unicode-width.workspace = true
