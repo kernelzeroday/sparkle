@@ -164,7 +164,7 @@ ACCOUNT_DETAIL = re.compile(
 # One collector's identity appears in otherwise generic captures, so it is replaced with neutral
 # values. The longest forms come first.
 IDENTITY = [
-    (re.compile(r"asgeirtj@[a-z0-9.-]+", re.I), "user@example.com"),
+    (re.compile(r"asgeirtj@[a-z0-9-]+(?:\.[a-z0-9-]+)+", re.I), "user@example.com"),
     (re.compile(r"[ÁA]sgeir Thor Johnson|[ÁA]sgeir Thor"), "User"),
     (re.compile(r"asgeirtj", re.I), "user"),
     (re.compile(r"[ÁA]sgeir"), "User"),
