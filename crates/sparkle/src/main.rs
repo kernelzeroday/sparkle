@@ -93,7 +93,7 @@ fn prepare(args: &ModelArgs) -> Result<RunContext> {
 
     let inherit = args.system.is_none() && history.is_empty();
     let named = match (&args.system_prompt, &args.persona) {
-        (Some(name), _) => Some(library::load(name)?),
+        (Some(name), _) => Some(library::load(name, Some(&paths.prompt_pack()))?),
         (None, Some(name)) => Some(persona_prompt(name)?),
         (None, None) if inherit => inherited_prompt(&paths, &registry)?,
         (None, None) => None,
@@ -151,7 +151,7 @@ fn persona_prompt(name: &str) -> Result<Loaded> {
 /// since gone missing must not stop sparkle from running.
 fn inherited_prompt(paths: &Paths, registry: &Registry) -> Result<Option<Loaded>> {
     if let Some(name) = library::saved_default(&paths.default_prompt()) {
-        match library::load(&name) {
+        match library::load(&name, Some(&paths.prompt_pack())) {
             Ok(prompt) => return Ok(Some(prompt)),
             Err(error) => eprintln!("Warning: ignoring the default system prompt: {error}"),
         }
@@ -365,6 +365,7 @@ async fn run_chat(args: ChatArgs) -> Result<()> {
 
     let settings = context.registry.settings.clone();
     let default_prompt_file = Some(context.paths.default_prompt());
+    let prompt_pack = Some(context.paths.prompt_pack());
     let show_reasoning = !thinking_hidden(args.hide_reasoning, &context.registry);
     let title = match &context.conversation_id {
         Some(id) => context.store.conversation_title(id)?,
@@ -401,6 +402,7 @@ async fn run_chat(args: ChatArgs) -> Result<()> {
         smart_titles: settings.smart_titles.unwrap_or(true),
         warn_percent: settings.warn_percent(),
         default_prompt_file,
+        prompt_pack,
     };
     if let Some(conversation) = sparkle_tui::run(session).await? {
         println!("Continue this conversation with: sparkle chat --cid {conversation}");
@@ -526,30 +528,40 @@ fn list_models(json_output: bool) -> Result<()> {
 }
 
 fn list_prompts(json_output: bool) -> Result<()> {
-    let default = library::saved_default(&Paths::discover()?.default_prompt());
+    let paths = Paths::discover()?;
+    let default = library::saved_default(&paths.default_prompt());
+    let pack = library::PromptPack::open(&paths.prompt_pack());
+    let built_in = library::PROMPTS.iter().map(|prompt| {
+        let family = prompt.family_name();
+        (prompt.id, prompt.title, family, prompt.date, prompt.origin.label(), prompt.text.len())
+    });
+    let packed = pack.iter().flat_map(|pack| &pack.entries).map(|entry| {
+        let (id, title, group) = (entry.id.as_str(), entry.title.as_str(), entry.group.as_str());
+        (id, title, group, entry.date.as_str(), entry.origin.as_str(), entry.bytes)
+    });
+    let prompts = built_in.chain(packed);
     if json_output {
-        let prompts: Vec<Value> = library::PROMPTS
-            .iter()
-            .map(|prompt| {
+        let rows: Vec<Value> = prompts
+            .map(|(id, title, family, date, origin, bytes)| {
                 json!({
-                    "id": prompt.id,
-                    "title": prompt.title,
-                    "family": prompt.family_name(),
-                    "date": prompt.date,
-                    "origin": prompt.origin.label(),
-                    "bytes": prompt.text.len(),
-                    "estimated_tokens": estimate_tokens(prompt.text.len()),
-                    "default": default.as_deref() == Some(prompt.id),
+                    "id": id,
+                    "title": title,
+                    "family": family,
+                    "date": date,
+                    "origin": origin,
+                    "bytes": bytes,
+                    "estimated_tokens": estimate_tokens(bytes),
+                    "default": default.as_deref() == Some(id),
                 })
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&prompts)?);
+        println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(());
     }
-    for prompt in library::PROMPTS {
-        let marker = if default.as_deref() == Some(prompt.id) { "*" } else { " " };
-        let size = context::size_label(prompt.text.len());
-        println!("{marker} {:<40} {:<8} {size:<20} {}", prompt.id, prompt.date, prompt.title);
+    for (id, title, _, date, _, bytes) in prompts {
+        let marker = if default.as_deref() == Some(id) { "*" } else { " " };
+        let size = context::size_label(bytes);
+        println!("{marker} {id:<40} {date:<8} {size:<20} {title}");
     }
     Ok(())
 }
@@ -558,7 +570,8 @@ fn prompts_command(action: Option<PromptsAction>) -> Result<()> {
     match action.unwrap_or(PromptsAction::List { json: false }) {
         PromptsAction::List { json } => list_prompts(json),
         PromptsAction::Show { name } => {
-            print!("{}", library::load(&name)?.text);
+            let pack = Paths::discover()?.prompt_pack();
+            print!("{}", library::load(&name, Some(&pack))?.text);
             Ok(())
         }
         PromptsAction::Default { name: None } => {
@@ -569,12 +582,13 @@ fn prompts_command(action: Option<PromptsAction>) -> Result<()> {
             Ok(())
         }
         PromptsAction::Default { name: Some(name) } => {
-            let file = Paths::discover()?.default_prompt();
+            let paths = Paths::discover()?;
+            let file = paths.default_prompt();
             if name == library::OFF {
                 library::save_default(&file, None)?;
                 println!("Removed the default system prompt");
             } else {
-                let stored = library::storable_name(&name)?;
+                let stored = library::storable_name(&name, Some(&paths.prompt_pack()))?;
                 library::save_default(&file, Some(&stored))?;
                 println!("New chats will start with {stored}");
             }

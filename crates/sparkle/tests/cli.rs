@@ -426,6 +426,29 @@ fn the_prompt_library_is_listed_and_printed() {
 }
 
 #[test]
+fn prompts_from_the_local_pack_are_listed_and_usable() {
+    let harness = Harness::new();
+    let pack = harness.home.join("prompt-pack");
+    std::fs::create_dir_all(pack.join("prompts/openai")).unwrap();
+    std::fs::write(
+        pack.join("index.tsv"),
+        "# sparkle prompt pack 1\nopenai/gpt-5.6-luna\tLuna\tOpenAI\t2026-09\tcaptured\t12\tsrc.md\n",
+    )
+    .unwrap();
+    std::fs::write(pack.join("prompts/openai/gpt-5.6-luna.md"), "You are Luna.").unwrap();
+
+    assert!(stdout(&harness.run(&["prompts"])).contains("openai/gpt-5.6-luna"));
+    assert_eq!(stdout(&harness.run(&["prompts", "show", "gpt-5.6-luna"])), "You are Luna.");
+    harness.run(&["-S", "gpt-5.6-luna", "hi"]);
+    assert_eq!(harness.last_body()["messages"][0]["content"], "You are Luna.");
+
+    harness.run(&["prompts", "default", "gpt-5.6-luna"]);
+    assert_eq!(stdout(&harness.run(&["prompts", "default"])).trim(), "openai/gpt-5.6-luna");
+    harness.run(&["hi"]);
+    assert_eq!(harness.last_body()["messages"][0]["content"], "You are Luna.");
+}
+
+#[test]
 fn a_library_prompt_or_a_file_can_be_the_system_prompt() {
     let harness = Harness::new();
     harness.run(&["-S", "openai/gpt-3.5", "hi"]);

@@ -452,6 +452,31 @@ fn picker_tabs(picker: &Picker, theme: &Theme, width: usize) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The source collections under Uncategorized, keeping the current one on screen.
+fn collection_tabs(picker: &Picker, theme: &Theme, width: usize) -> Line<'static> {
+    let labels: Vec<&str> = std::iter::once("all sources")
+        .chain(picker.collections.iter().map(String::as_str))
+        .collect();
+    let mut start = 0;
+    let span = |from: usize| -> usize {
+        labels[from..=picker.collection].iter().map(|name| name.width() + 2).sum()
+    };
+    while start < picker.collection && span(start) > width {
+        start += 1;
+    }
+    let mut spans = Vec::new();
+    for (index, name) in labels.iter().enumerate().skip(start) {
+        let style = if index == picker.collection {
+            Style::new().fg(theme.heading).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(theme.faint)
+        };
+        spans.push(Span::styled((*name).to_string(), style));
+        spans.push(Span::raw("  "));
+    }
+    Line::from(spans)
+}
+
 fn picker_row(app: &App, entry: &Entry, selected: bool, width: usize) -> Line<'static> {
     let theme = &app.theme;
     let icons = &app.icons;
@@ -468,13 +493,13 @@ fn picker_row(app: &App, entry: &Entry, selected: bool, width: usize) -> Line<'s
         if is_default { icons.starred } else { " " },
     );
 
-    let tokens = app.tokens_with_prompt(entry.text.len());
+    let tokens = app.tokens_with_prompt(entry.bytes);
     let badge = fit_badge(app, tokens);
     let badge_text = badge.as_ref().map_or("", |(_, text)| text.as_str());
-    let size = if entry.text.is_empty() {
+    let size = if entry.bytes == 0 {
         String::new()
     } else {
-        format!("~{}", compact_count(estimate_tokens(entry.text.len())))
+        format!("~{}", compact_count(estimate_tokens(entry.bytes)))
     };
     let tail = format!("{size:>6} {badge_text:>9}");
     let name_width = width.saturating_sub(marks.width() + tail.width() + 1);
@@ -498,10 +523,10 @@ fn picker_detail(app: &App, entry: &Entry) -> Line<'static> {
     if !entry.note.is_empty() {
         facts.push(entry.note.clone());
     }
-    if !entry.text.is_empty() {
-        facts.push(size_label(entry.text.len()));
+    if entry.bytes > 0 {
+        facts.push(size_label(entry.bytes));
     }
-    let tokens = app.tokens_with_prompt(entry.text.len());
+    let tokens = app.tokens_with_prompt(entry.bytes);
     let warning =
         app.context_window.and_then(|window| context::warning(tokens, window, app.warn_percent));
     let mut spans = Vec::new();
@@ -522,6 +547,8 @@ fn picker_detail(app: &App, entry: &Entry) -> Line<'static> {
 fn picker_keys(picker: &Picker, theme: &Theme) -> Line<'static> {
     let keys = if picker.path.is_some() {
         "tab complete · enter use · ctrl+d use and save as default · esc back"
+    } else if picker.has_collections() {
+        "↑↓ move · ←→ vendor · tab collection · type to filter · enter use · ctrl+d default · ctrl+o file · esc close"
     } else {
         "↑↓ move · ←→ vendor · type to filter · enter use · ctrl+d default · ctrl+o file · esc close"
     };
@@ -546,13 +573,18 @@ fn draw_picker(frame: &mut Frame<'_>, app: &App, picker: &Picker) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(theme.accent))
-        .title(Span::styled(" System prompts ", Style::new().fg(theme.accent)));
+        .title(Span::styled(
+            format!(" System prompts ({}) ", picker.visible().len()),
+            Style::new().fg(theme.accent),
+        ));
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
 
-    let [tabs, search, body, detail, keys] = Layout::vertical([
+    let collection_rows = u16::from(picker.has_collections());
+    let [tabs, collections, search, body, detail, keys] = Layout::vertical([
         Constraint::Length(1),
+        Constraint::Length(collection_rows),
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(1),
@@ -562,6 +594,10 @@ fn draw_picker(frame: &mut Frame<'_>, app: &App, picker: &Picker) {
 
     let tab_line = picker_tabs(picker, theme, usize::from(tabs.width));
     frame.render_widget(Paragraph::new(tab_line), tabs);
+    if picker.has_collections() {
+        let line = collection_tabs(picker, theme, usize::from(collections.width));
+        frame.render_widget(Paragraph::new(line), collections);
+    }
 
     let search_line = match &picker.path {
         Some(path) => Line::from(vec![
@@ -607,13 +643,13 @@ fn draw_picker(frame: &mut Frame<'_>, app: &App, picker: &Picker) {
     }
 
     let selected = picker.selected();
-    if let (Some(preview), Some(entry)) = (preview, selected) {
+    if let (Some(preview), Some(_)) = (preview, selected) {
         let pane = Block::new().borders(Borders::LEFT).border_style(Style::new().fg(theme.faint));
         let text_area = pane.inner(preview);
         frame.render_widget(pane, preview);
         // Long prompts are cut here because only the first screenful can be seen.
-        let shown: Vec<Line<'static>> = entry
-            .text
+        let shown: Vec<Line<'static>> = picker
+            .preview
             .lines()
             .take(usize::from(text_area.height))
             .map(|line| Line::from(line.to_string()))
@@ -991,7 +1027,9 @@ mod tests {
         assert!(over.contains("% over"), "{over}");
         assert!(over.contains("Over the context limit"), "{over}");
 
-        app.picker.as_mut().unwrap().filter = "claude-haiku-5.5".into();
+        let picker = app.picker.as_mut().unwrap();
+        picker.filter.clear();
+        picker.push_filter("claude-haiku-5.5");
         let near = screen(&mut app, 130, 30);
         assert!(near.contains("% near"), "{near}");
         assert!(near.contains("Close to the context limit"), "{near}");

@@ -41,6 +41,11 @@ impl Paths {
         self.data_dir.join("sparkle.db")
     }
 
+    /// The local prompt pack made by `scripts/build-prompt-pack.py`.
+    pub fn prompt_pack(&self) -> PathBuf {
+        self.data_dir.join("prompt-pack")
+    }
+
     /// Holds the name of the default system prompt, set from `/prompts` or `sparkle prompts`.
     pub fn default_prompt(&self) -> PathBuf {
         self.config_dir.join("default_prompt.txt")

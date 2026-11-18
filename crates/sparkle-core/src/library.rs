@@ -68,6 +68,88 @@ pub fn find(name: &str) -> Option<&'static Prompt> {
     matches.next().is_none().then_some(first)
 }
 
+/// One prompt in the local pack.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackEntry {
+    pub id: String,
+    pub title: String,
+    /// The vendor, or `Uncategorized`.
+    pub group: String,
+    pub date: String,
+    pub origin: String,
+    pub bytes: usize,
+    pub source: String,
+}
+
+impl PackEntry {
+    /// The collection an uncategorized prompt came from.
+    pub fn collection(&self) -> Option<&str> {
+        let mut parts = self.id.split('/');
+        (parts.next() == Some("uncategorized")).then(|| parts.next()).flatten()
+    }
+
+    fn parse(line: &str) -> Option<Self> {
+        let mut fields = line.split('\t');
+        let id = fields.next()?.to_string();
+        // Ids become file paths, so one must never point outside the pack.
+        let safe = !id.is_empty()
+            && !id.contains('\\')
+            && id.split('/').all(|part| !part.is_empty() && part != "." && part != "..");
+        if !safe {
+            return None;
+        }
+        Some(Self {
+            id,
+            title: fields.next()?.to_string(),
+            group: fields.next()?.to_string(),
+            date: fields.next()?.to_string(),
+            origin: fields.next()?.to_string(),
+            bytes: fields.next()?.parse().ok()?,
+            source: fields.next()?.to_string(),
+        })
+    }
+}
+
+/// The prompts built on this machine by `scripts/build-prompt-pack.py`.
+#[derive(Debug)]
+pub struct PromptPack {
+    directory: PathBuf,
+    pub entries: Vec<PackEntry>,
+}
+
+impl PromptPack {
+    /// Opens a pack, or returns `None` when this machine does not have one.
+    pub fn open(directory: &Path) -> Option<Self> {
+        let index = std::fs::read_to_string(directory.join("index.tsv")).ok()?;
+        let entries = index
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .filter_map(PackEntry::parse)
+            .collect();
+        Some(Self { directory: directory.to_path_buf(), entries })
+    }
+
+    /// Finds a prompt by its full id, or by its last part when only one prompt uses that name.
+    pub fn find(&self, name: &str) -> Option<&PackEntry> {
+        let exact = self.entries.iter().find(|entry| entry.id.eq_ignore_ascii_case(name));
+        exact.or_else(|| {
+            let last = |entry: &&PackEntry| {
+                entry.id.rsplit('/').next().is_some_and(|part| part.eq_ignore_ascii_case(name))
+            };
+            let mut matches = self.entries.iter().filter(last);
+            let first = matches.next()?;
+            matches.next().is_none().then_some(first)
+        })
+    }
+
+    /// Reads a prompt's text from disk.
+    pub fn read(&self, entry: &PackEntry) -> Result<String> {
+        let path = self.directory.join("prompts").join(format!("{}.md", entry.id));
+        std::fs::read_to_string(&path)
+            .map_err(|error| Error::Config(format!("could not read {}: {error}", path.display())))
+    }
+}
+
 /// A system prompt ready to send, with the short name to show for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Loaded {
@@ -97,13 +179,19 @@ pub fn load_file(path: &Path) -> Result<Loaded> {
     Ok(Loaded { label, text })
 }
 
-/// Loads a persona, a library prompt or a file, in that order.
-pub fn load(name: &str) -> Result<Loaded> {
+/// Loads a persona, a built-in prompt, a prompt from the local pack or a file, in that order.
+pub fn load(name: &str, pack: Option<&Path>) -> Result<Loaded> {
     if let Some(persona) = personas::find(name) {
         return Ok(Loaded { label: persona.name.to_string(), text: persona.prompt.to_string() });
     }
     if let Some(prompt) = find(name) {
         return Ok(Loaded { label: prompt.id.to_string(), text: fill_date(prompt.text, &today()) });
+    }
+    if let Some(pack) = pack.and_then(PromptPack::open)
+        && let Some(entry) = pack.find(name)
+    {
+        let text = fill_date(&pack.read(entry)?, &today());
+        return Ok(Loaded { label: entry.id.clone(), text });
     }
     let path = expand_home(name);
     if path.is_file() {
@@ -116,12 +204,12 @@ pub fn load(name: &str) -> Result<Loaded> {
 
 /// The form of a prompt name to save as the default. Files are stored as absolute paths so the
 /// default keeps working from any directory.
-pub fn storable_name(name: &str) -> Result<String> {
-    let loaded = load(name)?;
-    if personas::find(name).is_some() || find(name).is_some() {
+pub fn storable_name(name: &str, pack: Option<&Path>) -> Result<String> {
+    let loaded = load(name, pack)?;
+    let path = expand_home(name);
+    if !path.is_file() || personas::find(name).is_some() || find(name).is_some() {
         return Ok(loaded.label);
     }
-    let path = expand_home(name);
     let absolute = path.canonicalize().map_err(|error| {
         Error::Config(format!("could not resolve {}: {error}", path.display()))
     })?;
@@ -153,7 +241,7 @@ pub fn save_default(file: &Path, name: Option<&str>) -> Result<()> {
 
 /// Replaces the date placeholders vendors leave in their prompts.
 fn fill_date(text: &str, date: &str) -> String {
-    ["{{currentDateTime}}", "{{current_date}}", "{CURRENT_DATE}", "{CURRENTDATETIME}"]
+    ["{{currentDateTime}}", "{{current_date}}", "{CURRENT_DATE}", "{CURRENTDATETIME}", "{current date}"]
         .iter()
         .fold(text.to_string(), |text, placeholder| text.replace(placeholder, date))
 }
@@ -184,6 +272,65 @@ fn civil_date(days: u64) -> String {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    fn load(name: &str) -> Result<Loaded> {
+        super::load(name, None)
+    }
+
+    fn write_pack(name: &str) -> PathBuf {
+        let directory = temp_path(name);
+        std::fs::create_dir_all(directory.join("prompts/openai")).unwrap();
+        std::fs::create_dir_all(directory.join("prompts/uncategorized/fabric")).unwrap();
+        std::fs::write(
+            directory.join("index.tsv"),
+            "# sparkle prompt pack 1\n\
+             openai/gpt-5.6-luna\tLuna\tOpenAI\t2026-09\tcaptured\t25\tsrc/luna.md\n\
+             uncategorized/fabric/summarize\tSummarize\tUncategorized\t\tcommunity\t9\tsrc/s.md\n\
+             ../../etc/passwd\tEscape\tOpenAI\t\tcaptured\t1\tsrc/x.md\n\
+             broken line\n",
+        )
+        .unwrap();
+        std::fs::write(directory.join("prompts/openai/gpt-5.6-luna.md"), "Luna on {{current_date}}")
+            .unwrap();
+        std::fs::write(directory.join("prompts/uncategorized/fabric/summarize.md"), "Summarize")
+            .unwrap();
+        directory
+    }
+
+    #[test]
+    fn a_pack_lists_its_prompts_and_rejects_unsafe_rows() {
+        let directory = write_pack("pack-list");
+        let pack = PromptPack::open(&directory).unwrap();
+        assert_eq!(pack.entries.len(), 2);
+        assert_eq!(pack.entries[1].collection(), Some("fabric"));
+        assert_eq!(pack.entries[0].collection(), None);
+        assert_eq!(pack.find("GPT-5.6-LUNA").unwrap().id, "openai/gpt-5.6-luna");
+        assert!(pack.find("passwd").is_none());
+        assert!(PromptPack::open(&temp_path("no-such-pack")).is_none());
+    }
+
+    #[test]
+    fn pack_prompts_load_by_name_and_fill_dates() {
+        let directory = write_pack("pack-load");
+        let loaded = super::load("gpt-5.6-luna", Some(&directory)).unwrap();
+        assert_eq!(loaded.label, "openai/gpt-5.6-luna");
+        assert!(loaded.text.starts_with("Luna on 20"), "{}", loaded.text);
+        assert_eq!(
+            storable_name("summarize", Some(&directory)).unwrap(),
+            "uncategorized/fabric/summarize"
+        );
+        assert!(load("gpt-5.6-luna").is_err(), "without a pack the name is unknown");
+    }
+
+    #[test]
+    fn built_in_prompts_win_over_pack_prompts_with_the_same_name() {
+        let directory = write_pack("pack-priority");
+        let index = std::fs::read_to_string(directory.join("index.tsv")).unwrap();
+        let extra = "openai/gpt-3.5\tOther\tOpenAI\t\tcaptured\t5\tsrc/o.md\n";
+        std::fs::write(directory.join("index.tsv"), index + extra).unwrap();
+        let loaded = super::load("openai/gpt-3.5", Some(&directory)).unwrap();
+        assert!(loaded.text.contains("GPT-3.5"));
+    }
 
     fn temp_path(name: &str) -> PathBuf {
         let directory = std::env::temp_dir().join(format!("sparkle-library-{}", std::process::id()));
@@ -274,18 +421,18 @@ mod tests {
 
     #[test]
     fn stored_names_are_canonical() {
-        assert_eq!(storable_name("gpt-3.5").unwrap(), "openai/gpt-3.5");
+        assert_eq!(storable_name("gpt-3.5", None).unwrap(), "openai/gpt-3.5");
         let path = temp_path("stored.md");
         std::fs::write(&path, "text").unwrap();
-        let stored = storable_name(path.to_str().unwrap()).unwrap();
+        let stored = storable_name(path.to_str().unwrap(), None).unwrap();
         assert!(Path::new(&stored).is_absolute(), "{stored}");
-        assert!(storable_name("no-such-prompt").is_err());
+        assert!(storable_name("no-such-prompt", None).is_err());
     }
 
     #[test]
     fn date_placeholders_are_filled() {
         assert_eq!(fill_date("Today is {{currentDateTime}}.", "2026-11-18"), "Today is 2026-11-18.");
-        assert_eq!(fill_date("{CURRENT_DATE} {{current_date}}", "D"), "D D");
+        assert_eq!(fill_date("{CURRENT_DATE} {{current_date}} {current date}", "D"), "D D D");
         assert!(!load("anthropic/claude-3-opus").unwrap().text.contains("{{currentDateTime}}"));
     }
 

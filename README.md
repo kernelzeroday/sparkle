@@ -77,6 +77,16 @@ fill alongside the current conversation. Prompts that reach the warning threshol
 next request is in that range, and one-shot prompts print it to stderr. Sizes are estimated at four
 bytes per token. Context limits are known only for servers that report one, such as `llama-server`.
 
+### Local prompt pack
+
+`scripts/build-prompt-pack.py` imports every usable system prompt from a folder of prompt
+collections (`~/Documents/prompt-libraries` by default) into sparkle's data folder. Model prompts
+join their vendor's tab, and the rest appear under **Uncategorized**, where `tab` switches between
+source collections. The pack is never committed because its sources carry many different licenses.
+
+The build leaves out jailbreak, sexual, roleplay and harmful content, and holds back anything that
+looks like personal data. `REPORT.tsv` in the pack lists every file and the reason for its outcome.
+
 The same actions work without the browser:
 
 ```sh

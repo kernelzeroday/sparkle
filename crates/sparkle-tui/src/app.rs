@@ -82,6 +82,8 @@ pub struct ChatSession {
     pub warn_percent: u8,
     /// Where the default system prompt is saved. Without one, defaults cannot be changed.
     pub default_prompt_file: Option<PathBuf>,
+    /// The local prompt pack, when this machine has one.
+    pub prompt_pack: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -256,6 +258,7 @@ pub struct App {
     /// The saved default system prompt.
     pub default_prompt: Option<String>,
     default_prompt_file: Option<PathBuf>,
+    prompt_pack: Option<PathBuf>,
     exit_armed: Option<Instant>,
     /// Transcript height at the last draw, used to hold the view steady while scrolled up.
     pub last_line_count: usize,
@@ -351,6 +354,7 @@ impl App {
             warn_percent: session.warn_percent,
             default_prompt,
             default_prompt_file: session.default_prompt_file,
+            prompt_pack: session.prompt_pack,
             exit_armed: None,
             last_line_count: 0,
             reply_filter: PrefillFilter::default(),
@@ -688,9 +692,13 @@ impl App {
     fn prompts_command(&mut self, argument: &str) {
         let (verb, rest) = argument.split_once(char::is_whitespace).unwrap_or((argument, ""));
         match (verb, rest.trim()) {
-            ("", _) => self.picker = Some(Picker::open(self.persona.as_deref())),
+            ("", _) => {
+                let pack = self.prompt_pack.as_deref();
+                self.picker = Some(Picker::open(self.persona.as_deref(), pack));
+            }
             ("file", "") => {
-                let mut picker = Picker::open(self.persona.as_deref());
+                let pack = self.prompt_pack.as_deref();
+                let mut picker = Picker::open(self.persona.as_deref(), pack);
                 picker.path = Some(String::new());
                 self.picker = Some(picker);
             }
@@ -728,7 +736,8 @@ impl App {
             self.notice = Some("System prompt cleared".into());
             return Ok(());
         }
-        let loaded = library::load(name).map_err(|error| error.to_string())?;
+        let pack = self.prompt_pack.as_deref();
+        let loaded = library::load(name, pack).map_err(|error| error.to_string())?;
         self.apply_prompt(loaded);
         Ok(())
     }
@@ -752,7 +761,8 @@ impl App {
         let stored = if name == library::OFF {
             None
         } else {
-            Some(library::storable_name(name).map_err(|error| error.to_string())?)
+            let pack = self.prompt_pack.as_deref();
+            Some(library::storable_name(name, pack).map_err(|error| error.to_string())?)
         };
         library::save_default(&file, stored.as_deref()).map_err(|error| error.to_string())?;
         self.notice = Some(match &stored {
@@ -799,13 +809,20 @@ impl App {
             KeyCode::Down => picker.move_by(1),
             KeyCode::PageUp => picker.move_by(-10),
             KeyCode::PageDown => picker.move_by(10),
-            KeyCode::Home => picker.cursor = 0,
+            KeyCode::Home => picker.move_by(isize::MIN),
             KeyCode::End => picker.move_by(isize::MAX),
-            KeyCode::Left | KeyCode::BackTab => picker.switch_group(-1),
-            KeyCode::Right | KeyCode::Tab => picker.switch_group(1),
+            KeyCode::Left => picker.switch_group(-1),
+            KeyCode::Right => picker.switch_group(1),
+            KeyCode::BackTab if picker.has_collections() => picker.switch_collection(-1),
+            KeyCode::Tab if picker.has_collections() => picker.switch_collection(1),
+            KeyCode::BackTab => picker.switch_group(-1),
+            KeyCode::Tab => picker.switch_group(1),
             KeyCode::Backspace => picker.pop_filter(),
             KeyCode::Char(typed) if !control => picker.push_filter(typed.encode_utf8(&mut [0; 4])),
             _ => {}
+        }
+        if let Some(picker) = &mut self.picker {
+            picker.refresh_preview();
         }
     }
 
@@ -1484,6 +1501,7 @@ pub(crate) mod tests {
             smart_titles: false,
             warn_percent: 80,
             default_prompt_file: None,
+            prompt_pack: None,
         }
     }
 
