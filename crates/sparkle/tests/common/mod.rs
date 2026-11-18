@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 
 pub const REPLY: &str = "Hello world\n\n```python\nprint('hi')\n```\n\n```sh\nls\n```";
 pub const GENERATED_TITLE: &str = "Mock chat title";
+pub const MOCK_SUMMARY: &str = "Mock summary";
 pub const CONTEXT_SIZE: u64 = 8000;
 const WAIT: Duration = Duration::from_secs(20);
 
@@ -77,11 +78,15 @@ fn respond(stream: &mut std::net::TcpStream, recorded: &Recorded) {
         return;
     }
     let pause = Duration::from_millis(if text.contains("slowly") { 700 } else { 0 });
-    let mut parts = vec![
-        sse(json!({ "reasoning_content": "Thinking hard" })),
-        sse(json!({ "content": "Hello " })),
-        sse(json!({ "content": "world\n\n```python\nprint('hi')\n```\n\n```sh\nls\n```" })),
-    ];
+    let mut parts = if text.starts_with("Summarize the conversation") {
+        vec![sse(json!({ "content": MOCK_SUMMARY }))]
+    } else {
+        vec![
+            sse(json!({ "reasoning_content": "Thinking hard" })),
+            sse(json!({ "content": "Hello " })),
+            sse(json!({ "content": "world\n\n```python\nprint('hi')\n```\n\n```sh\nls\n```" })),
+        ]
+    };
     if text.contains("prefill-progress") {
         let progress = json!({ "total": 4000, "cache": 1000, "processed": 2000, "time_ms": 50 });
         let chunk = json!({ "choices": [], "prompt_progress": progress });

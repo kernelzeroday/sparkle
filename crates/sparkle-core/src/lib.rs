@@ -1,5 +1,6 @@
 //! Domain types, configuration and model providers shared by every sparkle front end.
 
+pub mod compact;
 pub mod config;
 pub mod context;
 pub mod error;

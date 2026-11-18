@@ -50,7 +50,10 @@ Replies go to stdout. Reasoning and animation go to stderr, so pipes receive onl
 | `ctrl+c` or `ctrl+d` twice | Exit, when the input is empty |
 
 Commands: `/help`, `/new`, `/model`, `/effort`, `/persona`, `/system`, `/prefill`, `/retry`,
-`/edit`, `/quit`.
+`/edit`, `/compact`, `/quit`.
+
+`/compact [FOCUS]` replaces the conversation so far with a summary to free context, optionally
+telling the model what to focus on. The original messages stay in the history database.
 
 ## Configuration
 

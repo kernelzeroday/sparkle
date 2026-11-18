@@ -92,7 +92,8 @@ Status: **done** works today, **partial** usable with gaps, **planned** has a mi
 | Compare models side by side | M7 |
 | Prefill progress and context meter for local `llama-server` | done |
 | Context meter for remote providers | M7 |
-| Context compaction with `/compact` and automatically (see [ROADMAP.md](ROADMAP.md)) | M7 |
+| Manual context compaction with `/compact` (see [ROADMAP.md](ROADMAP.md)) | done |
+| Automatic context compaction (see [ROADMAP.md](ROADMAP.md)) | M7 |
 | Memory tools for models | after 1.0 (see [ROADMAP.md](ROADMAP.md)) |
 
 ## Tools and subagents
@@ -128,7 +129,7 @@ autonomous planning loop.
 | **M4 Providers** | OpenAI Responses, Anthropic and Gemini native streaming |
 | **M5 Tools** | Declarative tools, approval cards, tool logging, MCP client |
 | **M6 Embeddings** | `embed`, `embed-multi`, `similar`, `collections` |
-| **M7 Polish** | Compare view, remote context meter, context compaction, theme files, accessibility pass, 1.0 packaging |
+| **M7 Polish** | Compare view, remote context meter, automatic context compaction, theme files, accessibility pass, 1.0 packaging |
 
 ## Packaging
 

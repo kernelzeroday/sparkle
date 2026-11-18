@@ -76,6 +76,13 @@ fn render_turn(
             let bar = Span::styled("  ", Style::new());
             prefixed(&mut lines, &turn.text, columns, bar, Style::new().fg(theme.muted));
         }
+        Some(_) if turn.summary => {
+            lines.push(Line::from(Span::styled(
+                "Summary of earlier conversation",
+                Style::new().fg(theme.heading).add_modifier(Modifier::BOLD),
+            )));
+            lines.extend(markdown::render(&turn.text, width, theme, icons));
+        }
         Some(Role::User | Role::System) => {
             let bar = Span::styled("▍ ", Style::new().fg(theme.user));
             prefixed(&mut lines, &turn.text, columns, bar.clone(), Style::new().fg(theme.text));
@@ -234,6 +241,8 @@ fn activity_line(app: &App) -> Line<'static> {
     }
     if app.busy() {
         let label = match (app.phase, app.prompt_progress) {
+            (Phase::Compacting, Some(progress)) => format!("Compacting: {}", progress.label()),
+            (Phase::Compacting, None) => "Compacting".to_string(),
             (Phase::Waiting, Some(progress)) => progress.label(),
             (Phase::Waiting, None) => "Connecting".to_string(),
             (Phase::Thinking, _) => "Thinking".to_string(),
@@ -632,6 +641,57 @@ mod tests {
         assert!(screen.contains("1 file attached: ~256 tok (1 KB)"), "{screen}");
         assert!(screen.contains("Prefill: ~2 tok (5 B)"), "{screen}");
         assert!(screen.contains("Context window: 258k tokens"), "{screen}");
+    }
+
+    /// A finished exchange long enough for a short summary to replace.
+    async fn chat_ready_to_compact() -> (
+        App,
+        tokio::sync::mpsc::UnboundedReceiver<crate::app::StreamMessage>,
+        std::sync::Arc<crate::app::tests::FakeProvider>,
+    ) {
+        let reply = vec![StreamEvent::Text("a long answer ".repeat(40))];
+        let (mut app, mut receiver, provider) = app_with(reply, None);
+        type_text(&mut app, "hi");
+        enter(&mut app);
+        drain(&mut app, &mut receiver).await;
+        (app, receiver, provider)
+    }
+
+    #[tokio::test]
+    async fn activity_line_shows_compaction_and_how_to_stop_it() {
+        let (mut app, _receiver, _provider) = chat_ready_to_compact().await;
+        type_text(&mut app, "/compact");
+        enter(&mut app);
+        let line = text(&activity_line(&app));
+        assert!(line.contains("Compacting"), "{line}");
+        assert!(line.contains("esc to stop"), "{line}");
+
+        app.prompt_progress =
+            Some(PromptProgress { processed: 83_000, total: 197_000, cache: 0, time_ms: 40 });
+        let line = text(&activity_line(&app));
+        assert!(line.contains("Compacting: Prefilling 42%"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn a_compacted_chat_shows_the_summary_and_what_was_saved() {
+        let (mut app, mut receiver, provider) = chat_ready_to_compact().await;
+        app.context_window = Some(1000);
+        let before = text(&status_line(&app, 100));
+        provider.queue(vec![StreamEvent::Text("The **short** version".into())]);
+        type_text(&mut app, "/compact");
+        enter(&mut app);
+        drain(&mut app, &mut receiver).await;
+
+        let shown = screen(&mut app, 80, 24);
+        assert!(shown.contains("Summary of earlier conversation"), "{shown}");
+        assert!(shown.contains("The short version"), "{shown}");
+        assert!(shown.contains("Compacted 2 messages (~141 -> ~24 tokens)"), "{shown}");
+        assert!(!shown.contains("a long answer"), "{shown}");
+        assert!(!shown.contains("[Summary of the earlier"), "the header is for the model: {shown}");
+
+        let after = text(&status_line(&app, 100));
+        assert_ne!(before, after);
+        assert!(after.contains("~24/1k (2%)"), "{after}");
     }
 
     #[tokio::test]

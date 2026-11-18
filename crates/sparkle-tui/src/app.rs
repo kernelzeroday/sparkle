@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
-use sparkle_core::context::estimate_tokens;
+use sparkle_core::compact;
+use sparkle_core::context::{compact_count, estimate_tokens};
 use sparkle_core::personas;
 use sparkle_core::prefill::PrefillFilter;
 use sparkle_core::title;
@@ -32,6 +33,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/prefill", "Start the next reply with: /prefill TEXT"),
     ("/retry", "Regenerate the last reply"),
     ("/edit", "Edit the last reply in $EDITOR"),
+    ("/compact", "Summarize earlier messages to free context"),
     ("/quit", "Leave the chat"),
 ];
 
@@ -90,6 +92,8 @@ pub struct Turn {
     pub duration_ms: Option<u64>,
     pub stored_id: Option<String>,
     pub parent_id: Option<String>,
+    /// True for the summary that stands in for compacted turns.
+    pub summary: bool,
     pub cache: Option<(u16, bool, Vec<Line<'static>>)>,
 }
 
@@ -100,6 +104,28 @@ impl Turn {
 
     fn notice(text: impl Into<String>) -> Self {
         Self { text: text.into(), ..Self::default() }
+    }
+
+    /// A summary replacing earlier turns. The header reaches the model but is not drawn.
+    fn summary(text: impl Into<String>) -> Self {
+        Self {
+            context: compact::SUMMARY_HEADER.to_string(),
+            summary: true,
+            ..Self::new(Role::User, text)
+        }
+    }
+
+    /// Whether this turn is part of what the model receives.
+    fn is_sent(&self) -> bool {
+        self.role.is_some() && !self.text.is_empty()
+    }
+
+    /// A reply that ran to its end, which makes the turns up to it safe to summarize.
+    fn is_completed_reply(&self) -> bool {
+        self.role == Some(Role::Assistant)
+            && !self.text.trim().is_empty()
+            && self.error.is_none()
+            && !self.interrupted
     }
 
     /// The full message content the model receives.
@@ -126,6 +152,17 @@ pub enum Phase {
     Waiting,
     Thinking,
     Writing,
+    Compacting,
+}
+
+/// A `/compact` request on its way back from the model.
+#[derive(Debug, Default)]
+struct Compaction {
+    /// How many turns from the start of the chat the summary will replace.
+    replaced: usize,
+    reply: String,
+    truncated: bool,
+    usage: Option<Usage>,
 }
 
 #[derive(Debug)]
@@ -216,6 +253,7 @@ pub struct App {
     title_epoch: u64,
     title_task: Option<JoinHandle<()>>,
     first_reasoning: Option<Instant>,
+    compaction: Option<Compaction>,
     generation: u64,
     task: Option<JoinHandle<()>>,
     sender: UnboundedSender<StreamMessage>,
@@ -248,7 +286,11 @@ impl App {
                 parent = Some(message.id);
                 continue;
             }
-            let mut turn = Turn::new(message.role, message.content);
+            let mut turn = if message.compacted_from.is_some() {
+                Turn::summary(compact::summary_body(&message.content))
+            } else {
+                Turn::new(message.role, message.content)
+            };
             turn.reasoning = message.reasoning.unwrap_or_default();
             turn.model.clone_from(&session.model.id);
             turn.parent_id = parent.take();
@@ -299,6 +341,7 @@ impl App {
             title_epoch: 0,
             title_task: None,
             first_reasoning: None,
+            compaction: None,
             generation: 0,
             task: None,
             sender,
@@ -469,7 +512,8 @@ impl App {
 
     fn submit(&mut self) {
         if self.busy() {
-            self.notice = Some("Still replying. Press esc to stop.".into());
+            let activity = if self.phase == Phase::Compacting { "compacting" } else { "replying" };
+            self.notice = Some(format!("Still {activity}. Press esc to stop."));
             return;
         }
         let text = self.input.lines().join("\n");
@@ -568,6 +612,7 @@ impl App {
                     self.notice = Some("There is no reply to edit yet".into());
                 }
             }
+            "/compact" => self.begin_compaction(argument),
             other => {
                 // Keep what was typed so a mistyped command is not lost.
                 let notice = format!("Unknown command {other}. Try /help");
@@ -705,7 +750,7 @@ impl App {
         if !self.smart_titles || !replied || self.title_settled || self.title_attempts >= 3 {
             return;
         }
-        let first = self.turns.iter().find(|turn| turn.role == Some(Role::User));
+        let first = self.turns.iter().find(|turn| turn.role == Some(Role::User) && !turn.summary);
         let Some(prompt) = first.map(|turn| turn.text.clone()) else { return };
         self.title_attempts += 1;
 
@@ -760,11 +805,20 @@ impl App {
     }
 
     fn request_messages(&self, prefill: Option<&str>) -> Vec<Message> {
+        let mut messages = self.wire_messages(&self.turns);
+        if let Some(prefill) = prefill {
+            messages.push(Message::new(Role::Assistant, prefill));
+        }
+        messages
+    }
+
+    /// The system prompt followed by `turns`, as the model receives them.
+    fn wire_messages(&self, turns: &[Turn]) -> Vec<Message> {
         let mut messages = Vec::new();
         if let Some(system) = &self.system {
             messages.push(Message::new(Role::System, system.clone()));
         }
-        for turn in &self.turns {
+        for turn in turns {
             let Some(role) = turn.role.filter(|_| !turn.text.is_empty()) else { continue };
             match messages.last_mut() {
                 // After a failed reply two user messages meet, and strict servers reject that.
@@ -775,10 +829,169 @@ impl App {
                 _ => messages.push(Message::new(role, turn.wire_text())),
             }
         }
-        if let Some(prefill) = prefill {
-            messages.push(Message::new(Role::Assistant, prefill));
-        }
         messages
+    }
+
+    /// Asks the model to summarize every turn up to the last completed reply. Anything after that
+    /// reply, such as a message that failed to send, is kept word for word.
+    fn begin_compaction(&mut self, focus: &str) {
+        let Some(last) = self.turns.iter().rposition(Turn::is_completed_reply) else {
+            self.notice = Some("Nothing to compact yet. Wait for a finished reply first".into());
+            return;
+        };
+        // A local server may handle one request at a time, so the summary goes first.
+        self.stop_title_request();
+        let replaced = last + 1;
+        let request = compact::request(
+            &self.wire_model,
+            self.wire_messages(&self.turns[..replaced]),
+            self.options.clone(),
+            (!focus.is_empty()).then_some(focus),
+        );
+        self.compaction = Some(Compaction { replaced, ..Compaction::default() });
+        self.phase = Phase::Compacting;
+        self.start_stream(request);
+    }
+
+    fn on_compaction(&mut self, payload: Payload) {
+        let Some(compaction) = &mut self.compaction else { return };
+        match payload {
+            Payload::Event(StreamEvent::PromptProgress(progress)) => {
+                if compaction.reply.is_empty() {
+                    self.prompt_progress = Some(progress);
+                }
+            }
+            Payload::Event(StreamEvent::Reasoning(_)) => self.prompt_progress = None,
+            Payload::Event(StreamEvent::Text(text)) => {
+                compaction.reply.push_str(&text);
+                self.prompt_progress = None;
+            }
+            // The server counted the old conversation, so this says nothing about the new one.
+            Payload::Event(StreamEvent::Usage(usage)) => {
+                compaction.usage = Some(usage);
+                self.total_usage.input_tokens += usage.input_tokens;
+                self.total_usage.output_tokens += usage.output_tokens;
+            }
+            Payload::Event(StreamEvent::Finished(reason)) => {
+                compaction.truncated = reason == "length";
+            }
+            Payload::Failed(error) => self.finish_compaction(Err(error)),
+            Payload::Ended => self.finish_compaction(Ok(())),
+            Payload::Title(_) | Payload::ContextWindow(_) => {}
+        }
+    }
+
+    /// Returns to idle and hands back the compaction, if one was running.
+    fn stop_compaction(&mut self) -> Option<Compaction> {
+        self.compaction.as_ref()?;
+        self.phase = Phase::Idle;
+        self.started = None;
+        self.prompt_progress = None;
+        self.task = None;
+        self.dirty = true;
+        self.compaction.take()
+    }
+
+    fn finish_compaction(&mut self, outcome: std::result::Result<(), String>) {
+        let Some(compaction) = self.stop_compaction() else { return };
+        let applied = outcome.and_then(|()| self.apply_compaction(compaction));
+        if let Err(reason) = applied {
+            let text = format!("Compaction failed, so the conversation is unchanged: {reason}");
+            self.turns.push(Turn::notice(text));
+        }
+    }
+
+    /// Swaps the summarized turns for the summary, unless that would lose something.
+    fn apply_compaction(&mut self, compaction: Compaction) -> std::result::Result<(), String> {
+        if compaction.truncated {
+            return Err("the summary was cut off by the token limit".into());
+        }
+        let text = compact::summary_from_reply(&compaction.reply)
+            .ok_or("the model returned an empty summary")?;
+        let replaced = compaction.replaced;
+        let sent = || self.turns[..replaced].iter().filter(|turn| turn.is_sent());
+        let (count, before) = (sent().count(), sent().map(Turn::wire_len).sum::<usize>());
+
+        let mut summary = Turn::summary(text);
+        if summary.wire_len() >= before {
+            return Err("the summary was no shorter than the messages it would replace".into());
+        }
+        summary.model.clone_from(&self.model);
+        summary.usage = compaction.usage;
+        // The summary hangs from the stored system prompt, which stays at the root of the thread.
+        summary.parent_id =
+            self.turns.iter().find(|turn| turn.role.is_some()).and_then(|turn| turn.parent_id.clone());
+        let saved = self
+            .save_compaction(&summary, replaced)
+            .map_err(|error| format!("could not save the summary: {error}"))?;
+
+        let after = summary.wire_len();
+        let notice = Turn::notice(format!(
+            "Compacted {count} message{} (~{} -> ~{} tokens)",
+            if count == 1 { "" } else { "s" },
+            compact_count(estimate_tokens(before)),
+            compact_count(estimate_tokens(after)),
+        ));
+        if let Some((summary_id, kept_ids)) = saved {
+            summary.stored_id = Some(summary_id.clone());
+            self.relink_kept_turns(replaced, summary_id, kept_ids);
+        }
+        drop(self.turns.splice(..replaced, [summary, notice]));
+        self.measured_context = None;
+        self.scroll = 0;
+        Ok(())
+    }
+
+    /// Stores the summary and copies of the turns kept after it, when this chat is being saved.
+    fn save_compaction(
+        &self,
+        summary: &Turn,
+        replaced: usize,
+    ) -> sparkle_store::Result<Option<(String, Vec<String>)>> {
+        let (Some(store), Some(conversation), Some(tip)) =
+            (&self.store, &self.conversation_id, self.tip_id())
+        else {
+            return Ok(None);
+        };
+        let content = summary.wire_text();
+        let message = NewMessage {
+            model: Some(&summary.model),
+            usage: summary.usage,
+            ..NewMessage::plain(summary.parent_id.as_deref(), Role::User, &content)
+        };
+        let kept: Vec<(&Turn, String)> = self.turns[replaced..]
+            .iter()
+            .filter(|turn| turn.is_sent())
+            .map(|turn| (turn, turn.wire_text()))
+            .collect();
+        let copies: Vec<NewMessage<'_>> = kept
+            .iter()
+            .filter_map(|(turn, content)| {
+                Some(NewMessage {
+                    parent_id: None,
+                    role: turn.role?,
+                    content,
+                    reasoning: (!turn.reasoning.is_empty()).then_some(turn.reasoning.as_str()),
+                    model: (!turn.model.is_empty()).then_some(turn.model.as_str()),
+                    usage: turn.usage,
+                    duration_ms: turn.duration_ms,
+                })
+            })
+            .collect();
+        store.compact(conversation, message, &tip, &copies).map(Some)
+    }
+
+    /// Points the turns after the summary at their copies on the new branch.
+    fn relink_kept_turns(&mut self, replaced: usize, summary_id: String, kept_ids: Vec<String>) {
+        let mut parent = summary_id;
+        let mut ids = kept_ids.into_iter();
+        for turn in self.turns[replaced..].iter_mut().filter(|turn| turn.role.is_some()) {
+            turn.parent_id = Some(parent.clone());
+            turn.stored_id = if turn.is_sent() { ids.next() } else { None };
+            if let Some(id) = &turn.stored_id {
+                parent.clone_from(id);
+            }
+        }
     }
 
     fn begin_reply(&mut self) {
@@ -796,6 +1009,11 @@ impl App {
         turn.parent_id = self.tip_id();
         self.turns.push(turn);
         self.phase = Phase::Waiting;
+        self.start_stream(request);
+    }
+
+    /// Sends a request in the background, with its events arriving through `on_stream`.
+    fn start_stream(&mut self, request: ChatRequest) {
         self.started = Some(Instant::now());
         self.first_reasoning = None;
         self.prompt_progress = None;
@@ -842,6 +1060,10 @@ impl App {
             return;
         }
         self.dirty = true;
+        if self.phase == Phase::Compacting {
+            self.on_compaction(message.payload);
+            return;
+        }
         match message.payload {
             Payload::Event(event) => self.on_event(event),
             Payload::Failed(error) => {
@@ -906,6 +1128,10 @@ impl App {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+        if self.stop_compaction().is_some() {
+            self.notice = Some("Compaction stopped. The conversation is unchanged".into());
+            return;
+        }
         if let Some(turn) = self.turns.last_mut() {
             turn.interrupted = true;
         }
@@ -955,17 +1181,27 @@ pub(crate) mod tests {
     use futures_util::future::BoxFuture;
     use futures_util::stream;
     use sparkle_core::{EventStream, Result};
+    use std::collections::VecDeque;
     use std::sync::Mutex;
 
     pub(crate) struct FakeProvider {
         pub events: Vec<StreamEvent>,
+        /// Replies for the next requests, used ahead of `events`.
+        pub queued: Mutex<VecDeque<Vec<StreamEvent>>>,
         pub requests: Mutex<Vec<ChatRequest>>,
+    }
+
+    impl FakeProvider {
+        pub(crate) fn queue(&self, events: Vec<StreamEvent>) {
+            self.queued.lock().unwrap().push_back(events);
+        }
     }
 
     impl Provider for FakeProvider {
         fn stream<'a>(&'a self, request: &'a ChatRequest) -> BoxFuture<'a, Result<EventStream>> {
             self.requests.lock().unwrap().push(request.clone());
-            let events = self.events.clone();
+            let queued = self.queued.lock().unwrap().pop_front();
+            let events = queued.unwrap_or_else(|| self.events.clone());
             Box::pin(async move {
                 Ok(Box::pin(stream::iter(events.into_iter().map(Ok))) as EventStream)
             })
@@ -985,12 +1221,26 @@ pub(crate) mod tests {
         events: Vec<StreamEvent>,
         store: Option<Store>,
     ) -> (App, UnboundedReceiver<StreamMessage>, Arc<FakeProvider>) {
-        let provider = Arc::new(FakeProvider { events, requests: Mutex::new(Vec::new()) });
-        let session = ChatSession {
+        let provider = Arc::new(FakeProvider {
+            events,
+            queued: Mutex::new(VecDeque::new()),
+            requests: Mutex::new(Vec::new()),
+        });
+        let (app, receiver) = App::new(session_with(provider.clone(), store, None, Vec::new()));
+        (app, receiver, provider)
+    }
+
+    fn session_with(
+        provider: Arc<FakeProvider>,
+        store: Option<Store>,
+        conversation_id: Option<String>,
+        history: Vec<StoredMessage>,
+    ) -> ChatSession {
+        ChatSession {
             model: ResolvedModel {
                 id: "mock".into(),
                 wire_name: "mock-wire".into(),
-                provider: provider.clone(),
+                provider,
             },
             resolver: Box::new(|name| Err(format!("unknown model {name}"))),
             system: None,
@@ -999,17 +1249,15 @@ pub(crate) mod tests {
             prefill: None,
             fragments: Vec::new(),
             store,
-            conversation_id: None,
-            history: Vec::new(),
+            conversation_id,
+            history,
             theme: Theme::DUSK,
             icons: Icons::ASCII,
             animations: true,
             show_reasoning: true,
             title: None,
             smart_titles: false,
-        };
-        let (app, receiver) = App::new(session);
-        (app, receiver, provider)
+        }
     }
 
     pub(crate) async fn drain(app: &mut App, receiver: &mut UnboundedReceiver<StreamMessage>) {
@@ -1542,6 +1790,436 @@ pub(crate) mod tests {
         press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(!app.should_quit, "a late second press only starts a new exit");
         assert!(app.exit_pending());
+    }
+
+    // Compaction
+
+    const SUMMARY: &str = "They settled on SQLite.";
+
+    fn long_reply() -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::Text("a long and detailed answer ".repeat(30)),
+            StreamEvent::Usage(Usage { input_tokens: 500, output_tokens: 200 }),
+            StreamEvent::Finished("stop".into()),
+        ]
+    }
+
+    fn summary_reply() -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::Reasoning("what matters here".into()),
+            StreamEvent::Text(SUMMARY.into()),
+            StreamEvent::Usage(Usage { input_tokens: 700, output_tokens: 10 }),
+            StreamEvent::Finished("stop".into()),
+        ]
+    }
+
+    async fn say(app: &mut App, receiver: &mut UnboundedReceiver<StreamMessage>, text: &str) {
+        type_text(app, text);
+        press(app, KeyCode::Enter, KeyModifiers::NONE);
+        drain(app, receiver).await;
+    }
+
+    /// A chat with two finished exchanges and a summary waiting to be requested.
+    async fn compactable(
+        store: Option<Store>,
+    ) -> (App, UnboundedReceiver<StreamMessage>, Arc<FakeProvider>) {
+        let (mut app, mut receiver, provider) = app_with(long_reply(), store);
+        app.system = Some("Be brief".into());
+        say(&mut app, &mut receiver, "first").await;
+        say(&mut app, &mut receiver, "second").await;
+        provider.queue(summary_reply());
+        (app, receiver, provider)
+    }
+
+    fn roles_and_text(app: &App) -> Vec<(Option<Role>, String)> {
+        app.turns.iter().map(|turn| (turn.role, turn.text.clone())).collect()
+    }
+
+    #[tokio::test]
+    async fn compact_is_offered_as_a_command() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        type_text(&mut app, "/co");
+        assert_eq!(tab(&mut app), "/compact ");
+        assert!(COMMANDS.contains(&("/compact", "Summarize earlier messages to free context")));
+    }
+
+    #[tokio::test]
+    async fn an_empty_chat_has_nothing_to_compact() {
+        let (mut app, mut receiver, provider) = app_with(reply_events(), None);
+        say(&mut app, &mut receiver, "/compact").await;
+        assert!(app.notice.as_deref().unwrap().contains("Nothing to compact"));
+        assert!(app.turns.is_empty());
+        assert!(provider.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_chat_without_a_finished_reply_has_nothing_to_compact() {
+        let (mut app, _receiver, provider) = app_with(Vec::new(), None);
+        type_text(&mut app, "hi");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        deliver(&mut app, StreamEvent::Text("partial".into()));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        let sent = provider.requests.lock().unwrap().len();
+
+        type_text(&mut app, "/compact");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.notice.as_deref().unwrap().contains("Nothing to compact"));
+        assert!(!app.busy());
+        assert_eq!(app.turns.len(), 2);
+        assert_eq!(provider.requests.lock().unwrap().len(), sent);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_summary_has_nothing_more_to_compact() {
+        let (mut app, mut receiver, provider) = compactable(None).await;
+        say(&mut app, &mut receiver, "/compact").await;
+        let sent = provider.requests.lock().unwrap().len();
+        say(&mut app, &mut receiver, "/compact").await;
+        assert!(app.notice.as_deref().unwrap().contains("Nothing to compact"));
+        assert_eq!(provider.requests.lock().unwrap().len(), sent);
+    }
+
+    #[tokio::test]
+    async fn compaction_is_refused_while_a_reply_is_streaming() {
+        let (mut app, _receiver, provider) = app_with(long_reply(), None);
+        type_text(&mut app, "hi");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        type_text(&mut app, "/compact");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.notice.as_deref(), Some("Still replying. Press esc to stop."));
+        assert_eq!(app.input.lines().join(""), "/compact", "the command is not lost");
+        assert_eq!(app.phase, Phase::Waiting);
+        tokio::task::yield_now().await;
+        assert_eq!(provider.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn other_input_waits_while_compacting() {
+        let (mut app, _receiver, _provider) = compactable(None).await;
+        type_text(&mut app, "/compact");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.phase, Phase::Compacting);
+        type_text(&mut app, "next question");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.notice.as_deref(), Some("Still compacting. Press esc to stop."));
+        assert_eq!(app.input.lines().join(""), "next question");
+    }
+
+    #[tokio::test]
+    async fn the_summary_request_carries_the_system_prompt_and_every_turn() {
+        let (mut app, mut receiver, provider) = compactable(None).await;
+        say(&mut app, &mut receiver, "/compact").await;
+
+        let requests = provider.requests.lock().unwrap();
+        let messages = &requests[2].messages;
+        assert_eq!(requests[2].model, "mock-wire");
+        assert_eq!(messages.len(), 6);
+        assert_eq!((messages[0].role, messages[0].content.as_str()), (Role::System, "Be brief"));
+        assert_eq!(messages[1].content, "first");
+        assert_eq!(messages[3].content, "second");
+        assert_eq!(messages[5].role, Role::User);
+        assert!(messages[5].content.starts_with("Summarize the conversation"));
+        assert!(!messages[5].content.contains("focus on"));
+    }
+
+    #[tokio::test]
+    async fn focus_text_reaches_the_summary_request() {
+        let (mut app, mut receiver, provider) = compactable(None).await;
+        say(&mut app, &mut receiver, "/compact   keep all SQL schemas  ").await;
+        let requests = provider.requests.lock().unwrap();
+        let instructions = &requests[2].messages.last().unwrap().content;
+        assert!(instructions.ends_with("focus on: keep all SQL schemas"), "{instructions}");
+    }
+
+    #[tokio::test]
+    async fn compaction_shrinks_what_the_next_request_sends() {
+        let (mut app, mut receiver, provider) = compactable(None).await;
+        let before = app.request_messages(None);
+        let (context_before, _) = app.context_used();
+        say(&mut app, &mut receiver, "/compact").await;
+
+        let after = app.request_messages(None);
+        assert_eq!(before.len(), 5);
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[0].content, "Be brief");
+        assert_eq!(app.system.as_deref(), Some("Be brief"));
+        assert_eq!(after[1].role, Role::User);
+        assert_eq!(after[1].content, format!("{}\n{SUMMARY}", compact::SUMMARY_HEADER));
+
+        let (context_after, estimated) = app.context_used();
+        assert!(context_after < context_before / 4, "{context_before} -> {context_after}");
+        assert!(estimated, "the server has not counted the compacted conversation");
+        assert_eq!(app.total_usage.input_tokens, 1700, "the summary's tokens were still spent");
+
+        say(&mut app, &mut receiver, "third").await;
+        let requests = provider.requests.lock().unwrap();
+        let next = &requests[3].messages;
+        assert_eq!(next.len(), 2, "strict servers reject two user messages in a row");
+        assert!(next[1].content.ends_with(&format!("{SUMMARY}\n\nthird")));
+    }
+
+    #[tokio::test]
+    async fn the_transcript_marks_the_compaction() {
+        let (mut app, mut receiver, _provider) = compactable(None).await;
+        say(&mut app, &mut receiver, "/compact").await;
+        assert_eq!(app.turns.len(), 2);
+        assert!(app.turns[0].summary);
+        assert_eq!(app.turns[0].text, SUMMARY);
+        assert_eq!(app.turns[1].role, None);
+        assert!(app.turns[1].text.starts_with("Compacted 4 messages (~"), "{}", app.turns[1].text);
+        assert!(app.turns[1].text.ends_with(" tokens)"), "{}", app.turns[1].text);
+    }
+
+    #[tokio::test]
+    async fn prefill_and_unsent_files_survive_compaction() {
+        let (mut app, mut receiver, provider) = compactable(None).await;
+        app.prefill = Some("Sure".into());
+        app.fragments = vec!["FILE".into()];
+        say(&mut app, &mut receiver, "/compact").await;
+        assert_eq!(app.prefill.as_deref(), Some("Sure"));
+        assert_eq!(app.fragments, ["FILE"]);
+        let requests = provider.requests.lock().unwrap();
+        assert!(requests[2].messages.iter().all(|m| m.content != "Sure" && m.content != "FILE"));
+    }
+
+    #[tokio::test]
+    async fn a_message_that_was_never_answered_is_kept_word_for_word() {
+        let store = Store::in_memory().unwrap();
+        let (mut app, mut receiver, provider) = compactable(Some(store)).await;
+        provider.queued.lock().unwrap().clear();
+        type_text(&mut app, "unanswered");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        // Lets this request take its reply before the summary is queued.
+        tokio::task::yield_now().await;
+        let generation = app.generation;
+        app.on_stream(StreamMessage { generation, payload: Payload::Failed("boom".into()) });
+        provider.queue(summary_reply());
+        say(&mut app, &mut receiver, "/compact").await;
+
+        let requests = provider.requests.lock().unwrap();
+        let summarized = &requests.last().unwrap().messages;
+        assert!(summarized.iter().all(|message| message.content != "unanswered"));
+        drop(requests);
+
+        let unanswered = app.turns.iter().find(|turn| turn.text == "unanswered").unwrap();
+        assert_eq!(unanswered.parent_id, app.turns[0].stored_id);
+        let last = app.request_messages(None).pop().unwrap();
+        assert!(last.content.ends_with(&format!("{SUMMARY}\n\nunanswered")));
+
+        let store = app.store.as_ref().unwrap();
+        let thread = store.thread(app.conversation_id.as_ref().unwrap()).unwrap();
+        assert_eq!(thread.last().unwrap().content, "unanswered");
+        assert_eq!(thread.last().unwrap().id, *unanswered.stored_id.as_ref().unwrap());
+    }
+
+    #[tokio::test]
+    async fn stopping_a_compaction_changes_nothing_and_ignores_late_events() {
+        for key in [KeyCode::Esc, KeyCode::Char('c')] {
+            let modifiers =
+                if key == KeyCode::Esc { KeyModifiers::NONE } else { KeyModifiers::CONTROL };
+            let store = Store::in_memory().unwrap();
+            let (mut app, _receiver, _provider) = compactable(Some(store)).await;
+            let turns = roles_and_text(&app);
+            let context = app.context_used();
+            type_text(&mut app, "/compact");
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+            assert!(app.busy());
+
+            let generation = app.generation;
+            deliver(&mut app, StreamEvent::Text("half a sum".into()));
+            press(&mut app, key, modifiers);
+            assert!(!app.busy());
+            assert!(!app.should_quit);
+            assert!(!app.exit_pending());
+            assert!(app.notice.as_deref().unwrap().contains("Compaction stopped"));
+
+            app.on_stream(StreamMessage {
+                generation,
+                payload: Payload::Event(StreamEvent::Text("mary".into())),
+            });
+            app.on_stream(StreamMessage { generation, payload: Payload::Ended });
+            assert_eq!(roles_and_text(&app), turns);
+            assert_eq!(app.context_used(), context);
+            assert!(!app.turns.last().unwrap().interrupted, "the last reply was not stopped");
+
+            let store = app.store.as_ref().unwrap();
+            assert_eq!(store.recent(1).unwrap()[0].messages, 5);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reply_can_follow_a_stopped_compaction() {
+        let (mut app, mut receiver, provider) = compactable(None).await;
+        provider.queued.lock().unwrap().clear();
+        type_text(&mut app, "/compact");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        say(&mut app, &mut receiver, "third").await;
+        assert!(app.turns.last().unwrap().is_completed_reply());
+        assert_eq!(app.turns.len(), 6);
+    }
+
+    /// Runs `/compact` against a reply and returns the notice left in the transcript.
+    async fn failed_compaction(reply: Vec<StreamEvent>) -> String {
+        let store = Store::in_memory().unwrap();
+        let (mut app, mut receiver, provider) = compactable(Some(store)).await;
+        provider.queued.lock().unwrap().clear();
+        provider.queue(reply);
+        let turns = roles_and_text(&app);
+        say(&mut app, &mut receiver, "/compact").await;
+        assert_eq!(roles_and_text(&app)[..turns.len()], turns[..]);
+        assert_eq!(app.turns.len(), turns.len() + 1);
+        assert_eq!(app.store.as_ref().unwrap().recent(1).unwrap()[0].messages, 5);
+        app.turns.pop().unwrap().text
+    }
+
+    #[tokio::test]
+    async fn an_empty_summary_is_rejected() {
+        let notice = failed_compaction(vec![StreamEvent::Text(" \n".into())]).await;
+        assert!(notice.contains("empty summary"), "{notice}");
+    }
+
+    #[tokio::test]
+    async fn a_summary_cut_off_by_the_token_limit_is_rejected() {
+        let reply =
+            vec![StreamEvent::Text("They settled".into()), StreamEvent::Finished("length".into())];
+        let notice = failed_compaction(reply).await;
+        assert!(notice.contains("cut off"), "{notice}");
+    }
+
+    #[tokio::test]
+    async fn a_summary_that_saves_nothing_is_rejected() {
+        let notice = failed_compaction(vec![StreamEvent::Text("word ".repeat(1000))]).await;
+        assert!(notice.contains("no shorter"), "{notice}");
+    }
+
+    #[tokio::test]
+    async fn a_server_error_leaves_the_conversation_alone() {
+        let (mut app, _receiver, provider) = compactable(None).await;
+        provider.queued.lock().unwrap().clear();
+        let turns = app.turns.len();
+        type_text(&mut app, "/compact");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let generation = app.generation;
+        app.on_stream(StreamMessage { generation, payload: Payload::Failed("boom".into()) });
+        assert!(!app.busy());
+        assert_eq!(app.turns.len(), turns + 1);
+        assert!(app.turns.last().unwrap().text.ends_with("unchanged: boom"));
+        assert!(app.turns[turns - 1].error.is_none(), "the earlier reply did not fail");
+    }
+
+    #[tokio::test]
+    async fn a_summary_that_cannot_be_saved_is_not_applied() {
+        let store = Store::in_memory().unwrap();
+        let (mut app, mut receiver, _provider) = compactable(Some(store)).await;
+        app.conversation_id = Some("missing".into());
+        let turns = roles_and_text(&app);
+        say(&mut app, &mut receiver, "/compact").await;
+        assert_eq!(roles_and_text(&app)[..turns.len()], turns[..]);
+        let notice = &app.turns.last().unwrap().text;
+        assert!(notice.contains("could not save the summary"), "{notice}");
+    }
+
+    #[tokio::test]
+    async fn compaction_works_without_saving_history() {
+        let (mut app, mut receiver, _provider) = compactable(None).await;
+        say(&mut app, &mut receiver, "/compact").await;
+        assert!(app.turns[0].summary);
+        assert_eq!(app.turns[0].stored_id, None);
+    }
+
+    #[tokio::test]
+    async fn a_resumed_chat_continues_from_the_summary_and_keeps_the_originals() {
+        let store = Store::in_memory().unwrap();
+        let (mut app, mut receiver, provider) = app_with(long_reply(), Some(store));
+        app.system = Some("Be brief".into());
+        say(&mut app, &mut receiver, "first").await;
+        say(&mut app, &mut receiver, "second").await;
+        provider.queue(summary_reply());
+        say(&mut app, &mut receiver, "/compact").await;
+
+        let conversation = app.conversation_id.clone().unwrap();
+        let store = app.store.take().unwrap();
+        assert_eq!(store.recent(1).unwrap()[0].messages, 6, "the originals are still stored");
+        let history = store.thread(&conversation).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].role, Role::System);
+        assert!(history[1].compacted_from.is_some());
+
+        let (mut resumed, mut receiver) = App::new(session_with(
+            provider.clone(),
+            Some(store),
+            Some(conversation.clone()),
+            history,
+        ));
+        assert_eq!(resumed.system.as_deref(), Some("Be brief"));
+        assert_eq!(resumed.turns.len(), 1);
+        assert!(resumed.turns[0].summary);
+        assert_eq!(resumed.turns[0].text, SUMMARY, "the header is not shown after resuming");
+
+        say(&mut resumed, &mut receiver, "third").await;
+        let requests = provider.requests.lock().unwrap();
+        let sent = &requests.last().unwrap().messages;
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].content, "Be brief");
+        let expected = format!("{}\n{SUMMARY}\n\nthird", compact::SUMMARY_HEADER);
+        assert_eq!(sent[1].content, expected);
+
+        let thread = resumed.store.as_ref().unwrap().thread(&conversation).unwrap();
+        assert_eq!(thread.len(), 4, "the new exchange continues the compacted branch");
+        assert_eq!(thread[2].content, "third");
+    }
+
+    #[tokio::test]
+    async fn a_second_compaction_replaces_the_first_summary() {
+        let store = Store::in_memory().unwrap();
+        let (mut app, mut receiver, provider) = compactable(Some(store)).await;
+        say(&mut app, &mut receiver, "/compact").await;
+        say(&mut app, &mut receiver, "third").await;
+        provider.queue(vec![StreamEvent::Text("Newer summary".into())]);
+        say(&mut app, &mut receiver, "/compact").await;
+
+        assert_eq!(app.turns.iter().filter(|turn| turn.summary).count(), 1);
+        assert_eq!(app.turns[0].text, "Newer summary");
+        let store = app.store.as_ref().unwrap();
+        let thread = store.thread(app.conversation_id.as_ref().unwrap()).unwrap();
+        let contents: Vec<_> = thread.iter().map(|message| message.content.as_str()).collect();
+        let expected = format!("{}\nNewer summary", compact::SUMMARY_HEADER);
+        assert_eq!(contents, ["Be brief", expected.as_str()]);
+    }
+
+    #[tokio::test]
+    async fn retry_and_edit_have_no_reply_to_act_on_after_compaction() {
+        let (mut app, mut receiver, provider) = compactable(None).await;
+        say(&mut app, &mut receiver, "/compact").await;
+        let sent = provider.requests.lock().unwrap().len();
+        say(&mut app, &mut receiver, "/retry").await;
+        assert_eq!(app.notice.as_deref(), Some("There is no reply to regenerate"));
+        say(&mut app, &mut receiver, "/edit").await;
+        assert_eq!(app.notice.as_deref(), Some("There is no reply to edit yet"));
+        assert_eq!(provider.requests.lock().unwrap().len(), sent);
+    }
+
+    #[tokio::test]
+    async fn a_summary_is_never_used_to_name_the_chat() {
+        let (mut app, mut receiver, provider) = compactable(None).await;
+        say(&mut app, &mut receiver, "/compact").await;
+        app.smart_titles = true;
+        say(&mut app, &mut receiver, "plan the migration").await;
+        let title = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(request) = provider.requests.lock().unwrap().last().cloned()
+                    && request.messages.len() == 2
+                    && request.messages[0].content.starts_with("Write a short title")
+                {
+                    return request;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a title is requested");
+        assert_eq!(title.messages[1].content, "plan the migration");
     }
 
     #[tokio::test]

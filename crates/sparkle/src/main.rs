@@ -208,15 +208,28 @@ fn save_exchange(
     Ok(conversation)
 }
 
+/// Adds a message, joining it to a user message before it because strict servers reject two in a
+/// row. A compaction summary is a user message, so the next prompt always meets one.
+fn push_message(messages: &mut Vec<Message>, message: Message) {
+    match messages.last_mut() {
+        Some(previous) if previous.role == Role::User && message.role == Role::User => {
+            previous.content.push_str("\n\n");
+            previous.content.push_str(&message.content);
+            previous.attachments.extend(message.attachments);
+        }
+        _ => messages.push(message),
+    }
+}
+
 fn request_messages(context: &RunContext, user: Message, prefill: Option<&str>) -> Vec<Message> {
     let mut messages = Vec::new();
     if let Some(system) = &context.system {
         messages.push(Message::new(Role::System, system.clone()));
     }
-    messages.extend(
-        context.history.iter().filter(|message| message.role != Role::System).map(StoredMessage::to_message),
-    );
-    messages.push(user);
+    for message in context.history.iter().filter(|message| message.role != Role::System) {
+        push_message(&mut messages, message.to_message());
+    }
+    push_message(&mut messages, user);
     if let Some(prefill) = prefill {
         messages.push(Message::new(Role::Assistant, prefill));
     }
@@ -354,7 +367,13 @@ async fn run_chat(args: ChatArgs) -> Result<()> {
 
 /// A turn kept only in memory, for chats started with --no-log.
 fn unsaved_message(role: Role, content: &str) -> StoredMessage {
-    StoredMessage { id: String::new(), role, content: content.to_string(), reasoning: None }
+    StoredMessage {
+        id: String::new(),
+        role,
+        content: content.to_string(),
+        reasoning: None,
+        compacted_from: None,
+    }
 }
 
 async fn run_plain_chat(mut context: RunContext, args: &ChatArgs) -> Result<()> {
@@ -554,6 +573,20 @@ mod tests {
         assert_eq!(combine_system(&fragments, None).unwrap(), "ALPHA\n\nBETA");
         assert_eq!(combine_system(&fragments, Some("SYS")).unwrap(), "ALPHA\n\nBETA\n\nSYS");
         assert_eq!(combine_system(&[], None), None);
+    }
+
+    #[test]
+    fn consecutive_user_messages_are_joined_with_their_attachments() {
+        let mut messages = vec![Message::new(Role::User, "summary")];
+        let mut next = Message::new(Role::User, "question");
+        next.attachments.push(Attachment::Url("https://example.com/a.png".into()));
+        push_message(&mut messages, next);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "summary\n\nquestion");
+        assert_eq!(messages[0].attachments.len(), 1);
+
+        push_message(&mut messages, Message::new(Role::Assistant, "answer"));
+        assert_eq!(messages.len(), 2);
     }
 
     #[test]

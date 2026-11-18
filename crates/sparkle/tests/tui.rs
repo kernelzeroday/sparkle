@@ -266,7 +266,7 @@ fn help_lists_every_command() {
     let mut tui = Tui::open(&harness, &[]);
     tui.send("/help\r");
     tui.wait_for("Show commands and keys");
-    for command in ["/new", "/model", "/effort", "/persona", "/system", "/prefill", "/retry", "/edit", "/quit"] {
+    for command in ["/new", "/model", "/effort", "/persona", "/system", "/prefill", "/retry", "/edit", "/compact", "/quit"] {
         tui.wait_for(command);
     }
     tui.quit();
@@ -404,6 +404,161 @@ fn unknown_commands_keep_the_typed_text() {
     tui.wait_for("/modle x");
     assert!(harness.chat_requests().is_empty());
     tui.quit_after_clearing();
+}
+
+// Compaction
+
+const SUMMARY_MESSAGE_START: &str = "[Summary of the earlier conversation";
+
+/// Opens a chat with two finished exchanges under the system prompt `Be brief`.
+fn chat_with_two_exchanges(harness: &Harness) -> Tui {
+    no_smart_titles(harness);
+    let tui = Tui::open(harness, &["-s", "Be brief"]);
+    tui.ask(harness, "first question");
+    tui.ask(harness, "second question");
+    tui
+}
+
+#[test]
+fn compact_with_nothing_to_summarize_says_so() {
+    let harness = Harness::new();
+    let mut tui = Tui::open(&harness, &[]);
+    tui.send("/compact\r");
+    tui.wait_for("Nothing to compact yet");
+    assert!(harness.chat_requests().is_empty());
+    tui.quit();
+}
+
+#[test]
+fn compact_replaces_the_conversation_with_a_summary() {
+    let harness = Harness::new();
+    let mut tui = chat_with_two_exchanges(&harness);
+    tui.ask(&harness, "/compact keep the names");
+
+    let request = contents(&harness.last_body());
+    assert_eq!(request[0], "Be brief");
+    assert_eq!(request[1], "first question");
+    assert!(request.last().unwrap().ends_with("focus on: keep the names"), "{request:?}");
+
+    tui.wait_for("Compacted 4 messages (~");
+    tui.wait_for("Summary of earlier conversation");
+    tui.wait_for(MOCK_SUMMARY);
+    tui.wait_gone("first question");
+
+    tui.ask(&harness, "third question");
+    let sent = contents(&harness.last_body());
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[0], "Be brief");
+    assert!(sent[1].starts_with(SUMMARY_MESSAGE_START), "{sent:?}");
+    assert!(sent[1].ends_with(&format!("{MOCK_SUMMARY}\n\nthird question")), "{sent:?}");
+    tui.quit();
+}
+
+#[test]
+fn compact_lowers_the_context_meter() {
+    let harness = Harness::new();
+    let mut tui = chat_with_two_exchanges(&harness);
+    tui.wait_for("18/8k (0%)");
+    tui.ask(&harness, "/compact");
+    tui.wait_for("Compacted 4 messages");
+    tui.wait_for("~24/8k (0%)");
+    tui.quit();
+}
+
+#[test]
+fn escape_stops_a_compaction_and_keeps_the_conversation() {
+    for key in [ESC, CTRL_C] {
+        let harness = Harness::new();
+        let mut tui = chat_with_two_exchanges(&harness);
+        tui.send("/compact slowly\r");
+        tui.wait_for("Compacting");
+        tui.send(key);
+        tui.wait_for("Compaction stopped");
+        assert!(tui.is_running());
+
+        tui.ask(&harness, "third question");
+        let sent = contents(&harness.last_body());
+        assert_eq!(sent[1], "first question");
+        assert_eq!(sent.last().unwrap(), "third question");
+        tui.quit();
+    }
+}
+
+#[test]
+fn a_failed_compaction_keeps_the_conversation() {
+    let harness = Harness::new();
+    let mut tui = chat_with_two_exchanges(&harness);
+    tui.ask(&harness, "/compact http500");
+    tui.wait_for("Compaction failed");
+    tui.wait_for("mock exploded");
+    tui.ask(&harness, "third question");
+    assert_eq!(contents(&harness.last_body())[1], "first question");
+    tui.quit();
+}
+
+#[test]
+fn a_compacted_chat_resumes_from_its_summary_in_every_front_end() {
+    let harness = Harness::new();
+    let mut tui = chat_with_two_exchanges(&harness);
+    tui.ask(&harness, "/compact");
+    tui.wait_for("Compacted 4 messages");
+    tui.quit();
+
+    let logs: Value = serde_json::from_str(&stdout(&harness.run(&["logs", "--json"]))).unwrap();
+    assert_eq!(logs[0]["messages"], 6, "the original messages stay in the database");
+    let id = logs[0]["id"].as_str().unwrap().to_string();
+
+    let mut resumed = Tui::open(&harness, &["chat", "--cid", &id]);
+    resumed.wait_for("Summary of earlier conversation");
+    resumed.wait_for(MOCK_SUMMARY);
+    assert!(!resumed.screen().contains(SUMMARY_MESSAGE_START), "{}", resumed.screen());
+    resumed.ask(&harness, "third question");
+    let sent = contents(&harness.last_body());
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[0], "Be brief");
+    assert!(sent[1].starts_with(SUMMARY_MESSAGE_START), "{sent:?}");
+    resumed.quit();
+
+    assert!(harness.run(&["-R", "-c", "fourth question"]).status.success());
+    let sent = harness.last_body();
+    let roles: Vec<_> = sent["messages"].as_array().unwrap().iter().map(|m| &m["role"]).collect();
+    assert_eq!(roles, ["system", "user", "assistant", "user"]);
+    let sent = contents(&sent);
+    assert!(sent[1].contains("third question"), "{sent:?}");
+    assert!(!sent.iter().any(|text| text == "first question"), "{sent:?}");
+    assert_eq!(sent[3], "fourth question");
+}
+
+#[test]
+fn a_one_shot_prompt_right_after_compaction_joins_the_summary() {
+    let harness = Harness::new();
+    let mut tui = chat_with_two_exchanges(&harness);
+    tui.ask(&harness, "/compact");
+    tui.wait_for("Compacted 4 messages");
+    tui.quit();
+
+    assert!(harness.run(&["-R", "-c", "next question"]).status.success());
+    let body = harness.last_body();
+    let roles: Vec<_> = body["messages"].as_array().unwrap().iter().map(|m| &m["role"]).collect();
+    assert_eq!(roles, ["system", "user"], "strict servers reject two user messages in a row");
+    let sent = contents(&body);
+    assert!(sent[1].starts_with(SUMMARY_MESSAGE_START), "{sent:?}");
+    assert!(sent[1].ends_with(&format!("{MOCK_SUMMARY}\n\nnext question")), "{sent:?}");
+}
+
+#[test]
+fn compaction_works_in_a_chat_that_is_not_saved() {
+    let harness = Harness::new();
+    no_smart_titles(&harness);
+    let mut tui = Tui::open(&harness, &["chat", "--no-log"]);
+    tui.ask(&harness, "private one");
+    tui.ask(&harness, "private two");
+    tui.ask(&harness, "/compact");
+    tui.wait_for("Compacted 4 messages");
+    tui.ask(&harness, "private three");
+    assert_eq!(contents(&harness.last_body()).len(), 1);
+    tui.quit();
+    assert_eq!(stdout(&harness.run(&["logs"])), "");
 }
 
 // Typing
