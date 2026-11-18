@@ -85,6 +85,14 @@ const SHARED: &[Case] = &[
         },
     },
     Case {
+        flag: "--system-prompt",
+        args: |_| strings(&["--system-prompt", "openai/gpt-3.5"]),
+        check: |r| {
+            let system = r.body["messages"][0]["content"].as_str().unwrap();
+            assert!(system.contains("GPT-3.5"), "{system}");
+        },
+    },
+    Case {
         flag: "--prefill",
         args: |_| strings(&["--prefill", "Sure"]),
         check: |r| {

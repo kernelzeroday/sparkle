@@ -411,6 +411,115 @@ fn personas_are_listed() {
 }
 
 #[test]
+fn the_prompt_library_is_listed_and_printed() {
+    let harness = Harness::new();
+    let text = stdout(&harness.run(&["prompts"]));
+    for id in ["openai/gpt-3.5", "openai/gpt-4o-2024-05", "anthropic/claude-opus-5.5", "xai/grok-1"] {
+        assert!(text.contains(id), "{id}");
+    }
+    let rows: Value = serde_json::from_str(&stdout(&harness.run(&["prompts", "list", "--json"]))).unwrap();
+    assert!(rows.as_array().unwrap().len() > 100);
+    assert_eq!(rows[0]["family"], "OpenAI");
+
+    let shown = stdout(&harness.run(&["prompts", "show", "openai/gpt-3.5"]));
+    assert!(shown.starts_with("You are ChatGPT"), "{shown}");
+}
+
+#[test]
+fn a_library_prompt_or_a_file_can_be_the_system_prompt() {
+    let harness = Harness::new();
+    harness.run(&["-S", "openai/gpt-3.5", "hi"]);
+    let system = harness.last_body()["messages"][0].clone();
+    assert_eq!(system["role"], "system");
+    assert!(system["content"].as_str().unwrap().contains("GPT-3.5"));
+
+    let path = harness.write_file("house-style.md", "Use the house style.");
+    harness.run(&["--system-prompt", &path, "hi"]);
+    assert_eq!(harness.last_body()["messages"][0]["content"], "Use the house style.");
+}
+
+#[test]
+fn system_fragments_still_combine_with_a_library_prompt() {
+    let harness = Harness::new();
+    let path = harness.write_file("extra.md", "EXTRA RULES");
+    harness.run(&["-S", "openai/gpt-3.5", "--sf", &path, "hi"]);
+    let system = harness.last_body()["messages"][0]["content"].as_str().unwrap().to_string();
+    assert!(system.starts_with("EXTRA RULES\n\nYou are ChatGPT"), "{system}");
+}
+
+#[test]
+fn an_unknown_system_prompt_is_an_error_before_any_request() {
+    let harness = Harness::new();
+    let output = harness.run(&["-S", "no-such-prompt", "hi"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("unknown system prompt"), "{}", stderr(&output));
+    assert!(harness.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn the_default_prompt_applies_until_something_overrides_it() {
+    let harness = Harness::new();
+    assert!(stdout(&harness.run(&["prompts", "default"])).contains("No default"));
+    let saved = stdout(&harness.run(&["prompts", "default", "gpt-3.5"]));
+    assert!(saved.contains("openai/gpt-3.5"), "{saved}");
+    assert_eq!(stdout(&harness.run(&["prompts", "default"])).trim(), "openai/gpt-3.5");
+
+    harness.run(&["hi"]);
+    let first = harness.last_body()["messages"][0]["content"].as_str().unwrap().to_string();
+    assert!(first.contains("GPT-3.5"), "{first}");
+
+    harness.run(&["-s", "Explicit", "hi"]);
+    assert_eq!(harness.last_body()["messages"][0]["content"], "Explicit");
+    harness.run(&["--persona", "concise", "hi"]);
+    let persona = harness.last_body()["messages"][0]["content"].as_str().unwrap().to_string();
+    assert!(persona.starts_with("Answer directly"), "{persona}");
+
+    harness.run(&["prompts", "default", "off"]);
+    harness.run(&["hi"]);
+    assert_eq!(harness.last_body()["messages"][0]["role"], "user");
+}
+
+#[test]
+fn a_default_prompt_file_that_disappeared_only_warns() {
+    let harness = Harness::new();
+    let path = harness.write_file("gone.md", "Soon gone");
+    harness.run(&["prompts", "default", &path]);
+    harness.run(&["hi"]);
+    assert_eq!(harness.last_body()["messages"][0]["content"], "Soon gone");
+
+    std::fs::remove_file(&path).unwrap();
+    let output = harness.run(&["hi"]);
+    assert!(output.status.success());
+    assert!(stderr(&output).contains("ignoring the default system prompt"), "{}", stderr(&output));
+    assert_eq!(harness.last_body()["messages"][0]["role"], "user");
+}
+
+#[test]
+fn continuing_a_conversation_keeps_its_own_system_prompt() {
+    let harness = Harness::new();
+    harness.run(&["-s", "Original", "hi"]);
+    harness.run(&["prompts", "default", "gpt-3.5"]);
+    harness.run(&["-c", "again"]);
+    assert_eq!(harness.last_body()["messages"][0]["content"], "Original");
+}
+
+#[test]
+fn prompts_near_or_over_the_context_window_warn_on_stderr() {
+    let harness = Harness::new();
+    let quiet = harness.run(&["-S", "openai/gpt-3.5", "hi"]);
+    assert!(!stderr(&quiet).contains("context limit"), "{}", stderr(&quiet));
+
+    // The mock server reports a window of 8000 tokens.
+    let near = harness.run(&["-S", "anthropic/claude-haiku-5.5", "hi"]);
+    assert!(stderr(&near).contains("Close to the context limit"), "{}", stderr(&near));
+    assert!(!stdout(&near).contains("context limit"));
+
+    let over = harness.run(&["-S", "xai/grok-4.7", "hi"]);
+    assert!(stderr(&over).contains("Over the context limit"), "{}", stderr(&over));
+    assert_eq!(harness.chat_requests().len(), 3, "a warning does not stop the request");
+}
+
+#[test]
 fn completions_and_man_page_are_generated() {
     let harness = Harness::new();
     for shell in ["bash", "zsh", "fish"] {

@@ -3,20 +3,29 @@ mod plain;
 
 use std::io::{IsTerminal, Read, Write};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser};
 use sparkle_core::config::{ModelEntry, Paths, Registry};
+use sparkle_core::context::{self, estimate_tokens};
+use sparkle_core::library::{self, Loaded};
 use sparkle_core::{Attachment, ChatRequest, Message, Options, Provider, Role, extract, personas, schema};
 use sparkle_store::{NewMessage, Store, StoredMessage};
 use sparkle_tui::{ChatSession, Icons, ResolvedModel, Theme};
 use serde_json::{Value, json};
 
-use cli::{ChatArgs, Cli, Command, ModelArgs, PromptArgs};
+use cli::{ChatArgs, Cli, Command, ModelArgs, PromptArgs, PromptsAction};
 use plain::{Outcome, RenderOptions};
+
+/// Requests smaller than this cannot trouble a context window, so its size is not looked up.
+const CONTEXT_CHECK_BYTES: usize = 4096;
+/// How long a one-shot prompt will wait to learn the model's context size.
+const CONTEXT_LOOKUP: Duration = Duration::from_secs(2);
 
 /// Settings, the model and the conversation resolved from the command line.
 struct RunContext {
+    paths: Paths,
     registry: Registry,
     store: Store,
     model: ModelEntry,
@@ -82,15 +91,12 @@ fn prepare(args: &ModelArgs) -> Result<RunContext> {
     let model = registry.resolve(&name)?;
     let provider = registry.provider(&model, args.key.as_deref());
 
-    let persona_name = args.persona.clone().or_else(|| {
-        let inherit = args.system.is_none() && history.is_empty();
-        registry.settings.persona.clone().filter(|_| inherit)
-    });
-    let persona = match &persona_name {
-        Some(name) => Some(personas::find(name).ok_or_else(|| {
-            anyhow!("unknown persona '{name}'. Run `sparkle personas` to see the list")
-        })?),
-        None => None,
+    let inherit = args.system.is_none() && history.is_empty();
+    let named = match (&args.system_prompt, &args.persona) {
+        (Some(name), _) => Some(library::load(name)?),
+        (None, Some(name)) => Some(persona_prompt(name)?),
+        (None, None) if inherit => inherited_prompt(&paths, &registry)?,
+        (None, None) => None,
     };
     let earlier_system =
         history.first().filter(|message| message.role == Role::System).map(|m| m.content.clone());
@@ -101,8 +107,7 @@ fn prepare(args: &ModelArgs) -> Result<RunContext> {
                 .with_context(|| format!("could not read system fragment {path}"))?,
         );
     }
-    let chosen =
-        args.system.clone().or_else(|| persona.map(|persona| persona.prompt.to_string()));
+    let chosen = args.system.clone().or_else(|| named.as_ref().map(|prompt| prompt.text.clone()));
     let system = match (chosen, earlier_system) {
         (Some(system), _) => combine_system(&fragments, Some(&system)),
         // Repeating the same --sf while continuing must not stack it onto the saved prompt.
@@ -122,17 +127,50 @@ fn prepare(args: &ModelArgs) -> Result<RunContext> {
 
     let options = parse_options(args, &registry);
     Ok(RunContext {
+        paths,
         registry,
         store,
         model,
         provider,
         system,
-        persona: persona.map(|persona| persona.name.to_string()),
+        persona: named.map(|prompt| prompt.label),
         options,
         fragments: prompt_fragments,
         conversation_id,
         history,
     })
+}
+
+fn persona_prompt(name: &str) -> Result<Loaded> {
+    let persona = personas::find(name)
+        .ok_or_else(|| anyhow!("unknown persona '{name}'. Run `sparkle personas` to see the list"))?;
+    Ok(Loaded { label: persona.name.to_string(), text: persona.prompt.to_string() })
+}
+
+/// The prompt a new conversation starts with when none was asked for. A saved default that has
+/// since gone missing must not stop sparkle from running.
+fn inherited_prompt(paths: &Paths, registry: &Registry) -> Result<Option<Loaded>> {
+    if let Some(name) = library::saved_default(&paths.default_prompt()) {
+        match library::load(&name) {
+            Ok(prompt) => return Ok(Some(prompt)),
+            Err(error) => eprintln!("Warning: ignoring the default system prompt: {error}"),
+        }
+    }
+    registry.settings.persona.as_deref().map(persona_prompt).transpose()
+}
+
+/// Warns on stderr when a request is close to or beyond the model's context window.
+async fn warn_about_context(context: &RunContext, messages: &[Message]) {
+    let bytes: usize = messages.iter().map(|message| message.content.len()).sum();
+    if bytes < CONTEXT_CHECK_BYTES {
+        return;
+    }
+    let lookup = tokio::time::timeout(CONTEXT_LOOKUP, context.provider.context_window()).await;
+    let Ok(Some(window)) = lookup else { return };
+    let percent = context.registry.settings.warn_percent();
+    if let Some((_, warning)) = context::warning(estimate_tokens(bytes), window, percent) {
+        eprintln!("Warning: {warning}");
+    }
 }
 
 /// Puts system fragments before the system prompt, separated by blank lines, as Python llm does.
@@ -271,6 +309,8 @@ async fn run_prompt(args: PromptArgs) -> Result<()> {
         stream: !args.no_stream,
     };
 
+    warn_about_context(&context, &request.messages).await;
+
     let buffered = args.json || args.extract || args.extract_last;
     let hide_reasoning = args.json || thinking_hidden(args.hide_reasoning, &context.registry);
     let render = RenderOptions { hide_reasoning, prefill: prefill.as_deref(), buffered };
@@ -324,6 +364,7 @@ async fn run_chat(args: ChatArgs) -> Result<()> {
     }
 
     let settings = context.registry.settings.clone();
+    let default_prompt_file = Some(context.paths.default_prompt());
     let show_reasoning = !thinking_hidden(args.hide_reasoning, &context.registry);
     let title = match &context.conversation_id {
         Some(id) => context.store.conversation_title(id)?,
@@ -358,6 +399,8 @@ async fn run_chat(args: ChatArgs) -> Result<()> {
         show_reasoning,
         title,
         smart_titles: settings.smart_titles.unwrap_or(true),
+        warn_percent: settings.warn_percent(),
+        default_prompt_file,
     };
     if let Some(conversation) = sparkle_tui::run(session).await? {
         println!("Continue this conversation with: sparkle chat --cid {conversation}");
@@ -423,6 +466,7 @@ async fn run_plain_chat(mut context: RunContext, args: &ChatArgs) -> Result<()> 
             schema: None,
             stream: true,
         };
+        warn_about_context(&context, &request.messages).await;
         let prefix = prefill.clone().unwrap_or_default();
         print!("{prefix}");
         std::io::stdout().flush()?;
@@ -481,6 +525,64 @@ fn list_models(json_output: bool) -> Result<()> {
     Ok(())
 }
 
+fn list_prompts(json_output: bool) -> Result<()> {
+    let default = library::saved_default(&Paths::discover()?.default_prompt());
+    if json_output {
+        let prompts: Vec<Value> = library::PROMPTS
+            .iter()
+            .map(|prompt| {
+                json!({
+                    "id": prompt.id,
+                    "title": prompt.title,
+                    "family": prompt.family_name(),
+                    "date": prompt.date,
+                    "origin": prompt.origin.label(),
+                    "bytes": prompt.text.len(),
+                    "estimated_tokens": estimate_tokens(prompt.text.len()),
+                    "default": default.as_deref() == Some(prompt.id),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&prompts)?);
+        return Ok(());
+    }
+    for prompt in library::PROMPTS {
+        let marker = if default.as_deref() == Some(prompt.id) { "*" } else { " " };
+        let size = context::size_label(prompt.text.len());
+        println!("{marker} {:<40} {:<8} {size:<20} {}", prompt.id, prompt.date, prompt.title);
+    }
+    Ok(())
+}
+
+fn prompts_command(action: Option<PromptsAction>) -> Result<()> {
+    match action.unwrap_or(PromptsAction::List { json: false }) {
+        PromptsAction::List { json } => list_prompts(json),
+        PromptsAction::Show { name } => {
+            print!("{}", library::load(&name)?.text);
+            Ok(())
+        }
+        PromptsAction::Default { name: None } => {
+            match library::saved_default(&Paths::discover()?.default_prompt()) {
+                Some(name) => println!("{name}"),
+                None => println!("No default system prompt is set"),
+            }
+            Ok(())
+        }
+        PromptsAction::Default { name: Some(name) } => {
+            let file = Paths::discover()?.default_prompt();
+            if name == library::OFF {
+                library::save_default(&file, None)?;
+                println!("Removed the default system prompt");
+            } else {
+                let stored = library::storable_name(&name)?;
+                library::save_default(&file, Some(&stored))?;
+                println!("New chats will start with {stored}");
+            }
+            Ok(())
+        }
+    }
+}
+
 fn show_logs(count: usize, json_output: bool) -> Result<()> {
     let paths = Paths::discover()?;
     let store = Store::open(&paths.database())?;
@@ -525,6 +627,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Some(Command::Prompts { action }) => prompts_command(action),
         Some(Command::Completions { shell }) => {
             clap_complete::generate(shell, &mut Cli::command(), "sparkle", &mut std::io::stdout());
             Ok(())

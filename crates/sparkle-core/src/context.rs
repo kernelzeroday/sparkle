@@ -46,9 +46,71 @@ pub fn usage_label(used: u64, window: u64, estimated: bool) -> String {
     format!("{mark}{}/{} ({percent}%)", compact_count(used), compact_count(window))
 }
 
+/// How full the context window may get before sparkle warns, unless configured otherwise.
+pub const DEFAULT_WARN_PERCENT: u8 = 80;
+
+/// How a request of some size sits against the model's context window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fit {
+    Fits,
+    Near,
+    Over,
+}
+
+/// Compares a token count with the window. `warn_percent` is where `Near` begins.
+pub fn fit(used: u64, window: u64, warn_percent: u8) -> Fit {
+    let (used, window) = (u128::from(used), u128::from(window.max(1)));
+    if used > window {
+        Fit::Over
+    } else if used * 100 >= window * u128::from(warn_percent) {
+        Fit::Near
+    } else {
+        Fit::Fits
+    }
+}
+
+/// The percentage of the window a token count takes up.
+pub fn percent_of(used: u64, window: u64) -> u64 {
+    (u128::from(used) * 100 / u128::from(window.max(1))) as u64
+}
+
+/// A sentence about a request that is close to or beyond the context window.
+pub fn warning(used: u64, window: u64, warn_percent: u8) -> Option<(Fit, String)> {
+    let state = fit(used, window, warn_percent);
+    let lead = match state {
+        Fit::Fits => return None,
+        Fit::Near => "Close to the context limit",
+        Fit::Over => "Over the context limit",
+    };
+    let (size, limit) = (compact_count(used), compact_count(window));
+    let percent = percent_of(used, window);
+    Some((state, format!("{lead}: ~{size} of {limit} tokens ({percent}%)")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fit_changes_at_the_threshold_and_at_the_window() {
+        assert_eq!(fit(799, 1000, 80), Fit::Fits);
+        assert_eq!(fit(800, 1000, 80), Fit::Near);
+        assert_eq!(fit(1000, 1000, 80), Fit::Near);
+        assert_eq!(fit(1001, 1000, 80), Fit::Over);
+        assert_eq!(fit(500, 1000, 50), Fit::Near);
+        assert_eq!(fit(2, 0, 80), Fit::Over);
+    }
+
+    #[test]
+    fn warnings_describe_the_size_and_stay_quiet_when_it_fits() {
+        assert_eq!(warning(100, 1000, 80), None);
+        let (state, text) = warning(52_000, 64_000, 80).unwrap();
+        assert_eq!(state, Fit::Near);
+        assert_eq!(text, "Close to the context limit: ~52k of 64k tokens (81%)");
+        let (state, text) = warning(120_000, 64_000, 80).unwrap();
+        assert_eq!(state, Fit::Over);
+        assert_eq!(text, "Over the context limit: ~120k of 64k tokens (187%)");
+    }
 
     #[test]
     fn counts_stay_short_across_unit_boundaries() {

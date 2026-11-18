@@ -74,6 +74,8 @@ pub struct Icons {
     pub collapsed: &'static str,
     pub expanded: &'static str,
     pub bullet: &'static str,
+    pub active: &'static str,
+    pub starred: &'static str,
 }
 
 impl Icons {
@@ -90,6 +92,8 @@ impl Icons {
         collapsed: "\u{f054}",
         expanded: "\u{f078}",
         bullet: "•",
+        active: "●",
+        starred: "★",
     };
 
     pub const UNICODE: Icons = Icons {
@@ -105,6 +109,8 @@ impl Icons {
         collapsed: "▸",
         expanded: "▾",
         bullet: "•",
+        active: "●",
+        starred: "★",
     };
 
     pub const ASCII: Icons = Icons {
@@ -120,6 +126,8 @@ impl Icons {
         collapsed: ">",
         expanded: "v",
         bullet: "-",
+        active: "o",
+        starred: "+",
     };
 
     /// Chooses from the `icons` setting, or from the terminal when it is `auto` or unset.

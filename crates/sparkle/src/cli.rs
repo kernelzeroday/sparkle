@@ -9,6 +9,7 @@ Examples:
   sparkle 'Capital of France?'             Ask one question
   sparkle --effort high 'Prove it'         Ask the model to think harder
   sparkle --persona code 'Reverse a list'  Use a built-in persona
+  sparkle -S openai/gpt-3.5 'Hello'        Use a system prompt from the library
   git diff | sparkle 'Review this'         Pipe in context
   sparkle -c 'Tell me more'                Continue the last conversation";
 
@@ -43,6 +44,11 @@ pub enum Command {
     },
     /// List built-in personas
     Personas,
+    /// Browse the system prompt library and set the default
+    Prompts {
+        #[command(subcommand)]
+        action: Option<PromptsAction>,
+    },
     /// Print a shell completion script
     Completions {
         /// Shell to generate completions for
@@ -51,6 +57,26 @@ pub enum Command {
     /// Print the man page
     #[command(hide = true)]
     Man,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PromptsAction {
+    /// List every built-in system prompt
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a system prompt
+    Show {
+        /// Library prompt, persona or file
+        name: String,
+    },
+    /// Show or set the system prompt new chats start with
+    Default {
+        /// Library prompt, persona or file, or `off` to remove the default
+        name: Option<String>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -104,6 +130,11 @@ pub struct ModelArgs {
     /// Built-in system prompt (see `sparkle personas`)
     #[arg(short = 'P', long, value_name = "NAME", help_heading = "Prompt")]
     pub persona: Option<String>,
+
+    /// System prompt from the library or a file (see `sparkle prompts`)
+    #[arg(short = 'S', long, value_name = "NAME", conflicts_with_all = ["system", "persona"],
+          help_heading = "Prompt")]
+    pub system_prompt: Option<String>,
 
     /// Start the reply with this text
     #[arg(long, value_name = "TEXT", help_heading = "Prompt")]

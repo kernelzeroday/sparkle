@@ -11,6 +11,7 @@ feature map and milestones.
 | System prompt, fragment and prefill sizes in the chat interface | done | |
 | Context usage for local servers that report `n_ctx` through `/props` | done | |
 | Manual compaction with `/compact` | done | |
+| System prompt library, `/prompts` browser and context warnings | done | |
 | Automatic compaction | planned, not implemented | M7 |
 | Context size for remote providers | planned, not implemented | M7 |
 | Memory tools | out of scope until after 1.0 | after 1.0 |

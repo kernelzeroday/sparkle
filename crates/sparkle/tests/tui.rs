@@ -325,6 +325,106 @@ fn persona_and_system_commands_change_the_system_prompt() {
 }
 
 #[test]
+fn the_prompt_browser_filters_and_applies_a_prompt() {
+    let harness = Harness::new();
+    let mut tui = Tui::open(&harness, &[]);
+    tui.command("/prompts");
+    tui.wait_for("System prompts");
+    tui.send("gpt-3.5");
+    tui.wait_for("ChatGPT GPT-3.5");
+    tui.send("\r");
+    tui.wait_gone("type to filter");
+    tui.wait_for("System prompt: openai/gpt-3.5");
+    tui.ask(&harness, "hello");
+    assert!(contents(&harness.last_body())[0].contains("GPT-3.5"));
+    tui.quit();
+}
+
+#[test]
+fn the_prompt_browser_closes_without_changing_anything() {
+    let harness = Harness::new();
+    let mut tui = Tui::open(&harness, &[]);
+    tui.command("/prompts");
+    tui.wait_for("System prompts");
+    tui.send("\x1b");
+    tui.wait_gone("System prompts");
+    tui.ask(&harness, "hello");
+    assert_eq!(harness.last_body()["messages"][0]["role"], "user");
+    tui.quit();
+}
+
+#[test]
+fn the_prompt_browser_warns_about_prompts_too_large_for_the_model() {
+    let harness = Harness::new();
+    let mut tui = Tui::open(&harness, &[]);
+    tui.wait_for("Context window: 8k tokens");
+    tui.command("/prompts");
+    tui.wait_for("System prompts");
+    tui.send("xai/grok-4.7");
+    tui.wait_for("Over the context limit");
+    tui.send("\r");
+    tui.wait_for("xai/grok-4.7: Over the context limit");
+    tui.quit();
+}
+
+#[test]
+fn a_default_chosen_in_the_browser_starts_the_next_chat() {
+    let harness = Harness::new();
+    let mut tui = Tui::open(&harness, &[]);
+    tui.command("/prompts");
+    tui.wait_for("System prompts");
+    tui.send("gpt-3.5");
+    tui.wait_for("ChatGPT GPT-3.5");
+    tui.send("\x04");
+    tui.wait_for("+");
+    tui.send("\x1b");
+    tui.wait_gone("System prompts");
+    tui.quit();
+
+    assert_eq!(stdout(&harness.run(&["prompts", "default"])).trim(), "openai/gpt-3.5");
+    let mut next = Tui::open(&harness, &[]);
+    next.wait_for("System prompt: openai/gpt-3.5");
+    next.quit();
+}
+
+#[test]
+fn the_prompt_browser_loads_an_external_file() {
+    let harness = Harness::new();
+    let path = harness.write_file("house-style.md", "Use the house style.");
+    let mut tui = Tui::open(&harness, &[]);
+    tui.command("/prompts");
+    tui.wait_for("System prompts");
+    tui.send("\x0f");
+    tui.wait_for("File:");
+    tui.send("/nonexistent/file.md\r");
+    tui.wait_for("could not read");
+    tui.send(&"\x7f".repeat("/nonexistent/file.md".len()));
+    tui.send(&format!("{path}\r"));
+    tui.wait_gone("System prompts");
+    tui.wait_for("System prompt: house-style.md");
+    tui.ask(&harness, "hello");
+    assert_eq!(contents(&harness.last_body())[0], "Use the house style.");
+    tui.quit();
+}
+
+#[test]
+fn prompts_command_accepts_a_name_directly() {
+    let harness = Harness::new();
+    let mut tui = Tui::open(&harness, &[]);
+    tui.command("/prompts anthropic/claude-3-opus");
+    tui.wait_for("anthropic/claude-3-opus");
+    tui.ask(&harness, "one");
+    assert!(contents(&harness.last_body())[0].contains("Claude"));
+    tui.command("/prompts off");
+    tui.wait_for("System prompt cleared");
+    tui.ask(&harness, "two");
+    assert_eq!(harness.last_body()["messages"][0]["role"], "user");
+    tui.command("/prompts nope");
+    tui.wait_for("unknown system prompt 'nope'");
+    tui.quit();
+}
+
+#[test]
 fn prefill_command_applies_to_the_next_reply_only() {
     let harness = Harness::new();
     let mut tui = Tui::open(&harness, &[]);

@@ -40,6 +40,11 @@ impl Paths {
     pub fn database(&self) -> PathBuf {
         self.data_dir.join("sparkle.db")
     }
+
+    /// Holds the name of the default system prompt, set from `/prompts` or `sparkle prompts`.
+    pub fn default_prompt(&self) -> PathBuf {
+        self.config_dir.join("default_prompt.txt")
+    }
 }
 
 /// `config.toml`. Every field is optional.
@@ -56,7 +61,16 @@ pub struct Settings {
     pub show_thinking: Option<bool>,
     /// Ask the model to name each new chat. Defaults to true.
     pub smart_titles: Option<bool>,
+    /// Warn once a request fills this percentage of the context window. Defaults to 80.
+    pub context_warn_percent: Option<u8>,
     pub models: Vec<ModelConfig>,
+}
+
+impl Settings {
+    /// The warning threshold, kept to a percentage that can actually be reached.
+    pub fn warn_percent(&self) -> u8 {
+        self.context_warn_percent.unwrap_or(crate::context::DEFAULT_WARN_PERCENT).clamp(1, 100)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]

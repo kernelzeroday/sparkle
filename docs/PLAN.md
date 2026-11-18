@@ -80,6 +80,7 @@ Status: **done** works today, **partial** usable with gaps, **planned** has a mi
 | --- | --- |
 | `--effort`, `--temp`, `--top-p`, `--max-tokens`, `--seed` | done |
 | Built-in personas with `--persona` and `/persona` | done |
+| Vendored system prompt library with `--system-prompt` and `/prompts` | done |
 | Prefill with `--prefill` and `/prefill` | done |
 | Edit replies with `/edit`, regenerate with `/retry` | done |
 | Animated thinking, collapsible reasoning, live stats | done |

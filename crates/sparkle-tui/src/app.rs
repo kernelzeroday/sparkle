@@ -1,12 +1,14 @@
 //! Chat state and behaviour, independent of the real terminal.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
 use sparkle_core::compact;
-use sparkle_core::context::{compact_count, estimate_tokens};
+use sparkle_core::context::{self, Fit, compact_count, estimate_tokens, size_label};
+use sparkle_core::library;
 use sparkle_core::personas;
 use sparkle_core::prefill::PrefillFilter;
 use sparkle_core::title;
@@ -21,6 +23,7 @@ use ratatui_textarea::TextArea;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
 
+use crate::picker::{self, Picker};
 use crate::theme::{Icons, Theme};
 
 pub const COMMANDS: &[(&str, &str)] = &[
@@ -29,6 +32,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/model", "Switch model: /model NAME"),
     ("/effort", "Set reasoning: /effort low|medium|high|auto"),
     ("/persona", "Use a built-in persona: /persona NAME|off"),
+    ("/prompts", "Browse system prompts: /prompts [NAME|off|default|file]"),
     ("/system", "Set the system prompt: /system TEXT"),
     ("/prefill", "Start the next reply with: /prefill TEXT"),
     ("/retry", "Regenerate the last reply"),
@@ -74,6 +78,10 @@ pub struct ChatSession {
     /// The saved title when resuming a conversation.
     pub title: Option<String>,
     pub smart_titles: bool,
+    /// Warn once a request fills this percentage of the context window.
+    pub warn_percent: u8,
+    /// Where the default system prompt is saved. Without one, defaults cannot be changed.
+    pub default_prompt_file: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -242,6 +250,12 @@ pub struct App {
     pub should_quit: bool,
     pub action: Option<Action>,
     pub completion: Option<Completion>,
+    /// The `/prompts` browser, while it is open.
+    pub picker: Option<Picker>,
+    pub warn_percent: u8,
+    /// The saved default system prompt.
+    pub default_prompt: Option<String>,
+    default_prompt_file: Option<PathBuf>,
     exit_armed: Option<Instant>,
     /// Transcript height at the last draw, used to hold the view steady while scrolled up.
     pub last_line_count: usize,
@@ -298,6 +312,8 @@ impl App {
             turn.stored_id = Some(message.id);
             turns.push(turn);
         }
+        let default_prompt =
+            session.default_prompt_file.as_deref().and_then(library::saved_default);
         let app = Self {
             model: session.model.id,
             wire_model: session.model.wire_name,
@@ -331,6 +347,10 @@ impl App {
             should_quit: false,
             action: None,
             completion: None,
+            picker: None,
+            warn_percent: session.warn_percent,
+            default_prompt,
+            default_prompt_file: session.default_prompt_file,
             exit_armed: None,
             last_line_count: 0,
             reply_filter: PrefillFilter::default(),
@@ -390,12 +410,31 @@ impl App {
         (measured + estimate_tokens(pending), self.measured_context.is_none() || pending > 0)
     }
 
+    /// Estimated tokens for the next request if `prompt_bytes` replaced the system prompt.
+    pub fn tokens_with_prompt(&self, prompt_bytes: usize) -> u64 {
+        let turns: usize =
+            self.turns.iter().filter(|turn| turn.role.is_some()).map(Turn::wire_len).sum();
+        let fragments: usize = self.fragments.iter().map(String::len).sum();
+        let prefill = self.prefill.as_ref().map_or(0, String::len);
+        estimate_tokens(prompt_bytes + turns + fragments + prefill)
+    }
+
+    /// A warning when the next request is close to or beyond the model's context window.
+    pub fn context_warning(&self) -> Option<(Fit, String)> {
+        let window = self.context_window?;
+        context::warning(self.context_used().0, window, self.warn_percent)
+    }
+
     pub fn on_terminal(&mut self, event: Event) {
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.on_key(key),
-            Event::Paste(text) => {
-                self.input.insert_str(text);
-            }
+            Event::Paste(text) => match &mut self.picker {
+                Some(Picker { path: Some(path), .. }) => path.push_str(text.trim()),
+                Some(picker) => picker.push_filter(text.trim()),
+                None => {
+                    self.input.insert_str(text);
+                }
+            },
             Event::Resize(..) => {}
             _ => return,
         }
@@ -434,6 +473,10 @@ impl App {
         // Any other key in between cancels a pending exit.
         let exit_pending = self.exit_armed.take().is_some_and(|armed| armed.elapsed() < EXIT_WINDOW);
         self.notice = None;
+        if self.picker.is_some() {
+            self.on_picker_key(key);
+            return;
+        }
         match key.code {
             KeyCode::Char('c') if control => {
                 if self.busy() {
@@ -584,6 +627,7 @@ impl App {
                 }
             },
             "/persona" => self.set_persona(argument),
+            "/prompts" => self.prompts_command(argument),
             "/system" => {
                 self.system = (!argument.is_empty()).then(|| argument.to_string());
                 self.persona = None;
@@ -638,6 +682,187 @@ impl App {
             self.notice = Some(format!("Persona: {}", persona.name));
         } else {
             self.notice = Some(format!("Unknown persona '{name}'"));
+        }
+    }
+
+    fn prompts_command(&mut self, argument: &str) {
+        let (verb, rest) = argument.split_once(char::is_whitespace).unwrap_or((argument, ""));
+        match (verb, rest.trim()) {
+            ("", _) => self.picker = Some(Picker::open(self.persona.as_deref())),
+            ("file", "") => {
+                let mut picker = Picker::open(self.persona.as_deref());
+                picker.path = Some(String::new());
+                self.picker = Some(picker);
+            }
+            ("file", path) => {
+                if let Err(error) = self.choose_file(path, false) {
+                    self.notice = Some(error);
+                }
+            }
+            ("default", "") => {
+                let current = self.default_prompt.as_deref().unwrap_or("none");
+                self.notice = Some(format!("Default system prompt: {current}"));
+            }
+            ("default", name) => {
+                if let Err(error) = self.set_default_prompt(name) {
+                    self.notice = Some(error);
+                }
+            }
+            _ => self.report_prompt(argument),
+        }
+    }
+
+    /// Switches prompt from a command, where any problem belongs on the notice line.
+    fn report_prompt(&mut self, name: &str) {
+        if let Err(error) = self.use_prompt(name) {
+            self.notice = Some(error);
+        }
+    }
+
+    /// Makes a named prompt or file the system prompt, and says how it fits the model.
+    fn use_prompt(&mut self, name: &str) -> Result<(), String> {
+        if name == library::OFF {
+            self.persona = None;
+            self.system = None;
+            self.measured_context = None;
+            self.notice = Some("System prompt cleared".into());
+            return Ok(());
+        }
+        let loaded = library::load(name).map_err(|error| error.to_string())?;
+        self.apply_prompt(loaded);
+        Ok(())
+    }
+
+    fn apply_prompt(&mut self, loaded: library::Loaded) {
+        let size = size_label(loaded.text.len());
+        self.system = Some(loaded.text);
+        self.persona = Some(loaded.label.clone());
+        self.measured_context = None;
+        self.notice = Some(match self.context_warning() {
+            Some((_, warning)) => format!("{}: {warning}", loaded.label),
+            None => format!("System prompt: {}, {size}", loaded.label),
+        });
+    }
+
+    /// Saves the prompt new chats start with. `off` removes the saved default.
+    fn set_default_prompt(&mut self, name: &str) -> Result<(), String> {
+        let Some(file) = self.default_prompt_file.clone() else {
+            return Err("The default system prompt cannot be saved here".into());
+        };
+        let stored = if name == library::OFF {
+            None
+        } else {
+            Some(library::storable_name(name).map_err(|error| error.to_string())?)
+        };
+        library::save_default(&file, stored.as_deref()).map_err(|error| error.to_string())?;
+        self.notice = Some(match &stored {
+            Some(name) => format!("New chats will start with {name}"),
+            None => "New chats will start without a default system prompt".into(),
+        });
+        self.default_prompt = stored;
+        Ok(())
+    }
+
+    fn on_picker_key(&mut self, key: KeyEvent) {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        if control && key.code == KeyCode::Char('c') {
+            self.picker = None;
+        } else if self.picker.as_ref().is_some_and(|picker| picker.path.is_some()) {
+            self.on_path_key(key, control);
+        } else {
+            self.on_browse_key(key, control);
+        }
+    }
+
+    fn on_browse_key(&mut self, key: KeyEvent, control: bool) {
+        let Some(picker) = &mut self.picker else { return };
+        match key.code {
+            KeyCode::Esc => self.picker = None,
+            KeyCode::Enter => {
+                let Some(name) = picker.selected().map(|entry| entry.name.clone()) else { return };
+                match self.use_prompt(&name) {
+                    Ok(()) => self.picker = None,
+                    Err(error) => self.show_picker_error(error),
+                }
+            }
+            KeyCode::Char('d') if control => {
+                let Some(name) = picker.selected().map(|entry| entry.name.clone()) else { return };
+                // Pressing it again on the current default removes it.
+                let is_default = self.default_prompt.as_deref() == Some(name.as_str());
+                let target = if is_default { library::OFF } else { name.as_str() };
+                if let Err(error) = self.set_default_prompt(target) {
+                    self.show_picker_error(error);
+                }
+            }
+            KeyCode::Char('o') if control => picker.path = Some(String::new()),
+            KeyCode::Up => picker.move_by(-1),
+            KeyCode::Down => picker.move_by(1),
+            KeyCode::PageUp => picker.move_by(-10),
+            KeyCode::PageDown => picker.move_by(10),
+            KeyCode::Home => picker.cursor = 0,
+            KeyCode::End => picker.move_by(isize::MAX),
+            KeyCode::Left | KeyCode::BackTab => picker.switch_group(-1),
+            KeyCode::Right | KeyCode::Tab => picker.switch_group(1),
+            KeyCode::Backspace => picker.pop_filter(),
+            KeyCode::Char(typed) if !control => picker.push_filter(typed.encode_utf8(&mut [0; 4])),
+            _ => {}
+        }
+    }
+
+    fn on_path_key(&mut self, key: KeyEvent, control: bool) {
+        let Some(picker) = &mut self.picker else { return };
+        let Some(path) = &mut picker.path else { return };
+        picker.error = None;
+        match key.code {
+            KeyCode::Esc => picker.path = None,
+            KeyCode::Tab => *path = picker::complete_path(path),
+            KeyCode::Backspace => {
+                path.pop();
+            }
+            KeyCode::Enter => {
+                let chosen = path.trim().to_string();
+                self.finish_file_choice(&chosen, false);
+            }
+            KeyCode::Char('d') if control => {
+                let chosen = path.trim().to_string();
+                self.finish_file_choice(&chosen, true);
+            }
+            KeyCode::Char(typed) if !control => path.push(typed),
+            _ => {}
+        }
+    }
+
+    /// Closes the browser once a file is in use, or keeps it open to show what went wrong.
+    fn finish_file_choice(&mut self, path: &str, make_default: bool) {
+        if path.is_empty() {
+            return;
+        }
+        match self.choose_file(path, make_default) {
+            Ok(()) => self.picker = None,
+            Err(error) => self.show_picker_error(error),
+        }
+    }
+
+    /// Uses an external file as the system prompt, and optionally saves it as the default.
+    fn choose_file(&mut self, path: &str, make_default: bool) -> Result<(), String> {
+        let file = library::expand_home(path);
+        let loaded = library::load_file(&file).map_err(|error| error.to_string())?;
+        self.apply_prompt(loaded);
+        if make_default {
+            // Saving replaces the notice, so a size warning has to be carried across.
+            let warning = self.context_warning();
+            let absolute = file.canonicalize().map_err(|error| error.to_string())?;
+            self.set_default_prompt(&absolute.to_string_lossy())?;
+            if let Some((_, warning)) = warning {
+                self.notice = Some(warning);
+            }
+        }
+        Ok(())
+    }
+
+    fn show_picker_error(&mut self, error: String) {
+        if let Some(picker) = &mut self.picker {
+            picker.error = Some(error);
         }
     }
 
@@ -1257,6 +1482,8 @@ pub(crate) mod tests {
             show_reasoning: true,
             title: None,
             smart_titles: false,
+            warn_percent: 80,
+            default_prompt_file: None,
         }
     }
 
@@ -1278,6 +1505,89 @@ pub(crate) mod tests {
     fn tab(app: &mut App) -> String {
         press(app, KeyCode::Tab, KeyModifiers::NONE);
         app.input.lines().join("\n")
+    }
+
+    fn default_file(name: &str) -> PathBuf {
+        let unique = format!("sparkle-app-{}-{name}", std::process::id());
+        let file = std::env::temp_dir().join(unique).join("default_prompt.txt");
+        let _ = std::fs::remove_file(&file);
+        file
+    }
+
+    #[tokio::test]
+    async fn choosing_a_prompt_replaces_the_system_prompt_and_its_measurement() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        app.measured_context = Some((500, 0));
+        app.use_prompt("openai/gpt-3.5").unwrap();
+        assert_eq!(app.persona.as_deref(), Some("openai/gpt-3.5"));
+        assert!(app.system.as_deref().unwrap().contains("GPT-3.5"));
+        assert_eq!(app.measured_context, None);
+
+        app.use_prompt("off").unwrap();
+        assert_eq!((app.persona.as_deref(), app.system.as_deref()), (None, None));
+    }
+
+    #[tokio::test]
+    async fn the_browser_keeps_keys_away_from_the_message_box() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        app.prompts_command("");
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(app.picker.as_ref().unwrap().filter, "x");
+        assert!(app.input_is_empty());
+        app.on_terminal(Event::Paste("grok".into()));
+        assert_eq!(app.picker.as_ref().unwrap().filter, "xgrok");
+
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(app.picker.is_none());
+        assert!(!app.exit_pending(), "closing the browser does not arm exit");
+    }
+
+    #[tokio::test]
+    async fn ctrl_d_toggles_the_highlighted_prompt_as_the_default() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        let file = default_file("toggle");
+        app.default_prompt_file = Some(file.clone());
+        app.prompts_command("");
+        app.picker.as_mut().unwrap().push_filter("gpt-3.5");
+
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(library::saved_default(&file).as_deref(), Some("openai/gpt-3.5"));
+        assert!(app.picker.is_some(), "the browser stays open");
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(library::saved_default(&file), None);
+        assert_eq!(app.default_prompt, None);
+    }
+
+    #[tokio::test]
+    async fn a_file_that_cannot_be_read_keeps_the_browser_open() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        app.prompts_command("file");
+        app.on_terminal(Event::Paste("/nonexistent/prompt.md".into()));
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let error = app.picker.as_ref().unwrap().error.clone().unwrap();
+        assert!(error.contains("could not read"), "{error}");
+        assert_eq!(app.system, None);
+
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.picker.as_ref().unwrap().path.is_none(), "esc returns to the list");
+    }
+
+    #[tokio::test]
+    async fn a_file_named_like_a_persona_is_still_read_as_a_file() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        let directory = default_file("persona-name").parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("concise");
+        std::fs::write(&path, "From the file").unwrap();
+        app.choose_file(path.to_str().unwrap(), false).unwrap();
+        assert_eq!(app.system.as_deref(), Some("From the file"));
+    }
+
+    #[tokio::test]
+    async fn defaults_cannot_be_saved_without_a_place_to_keep_them() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        app.prompts_command("default gpt-3.5");
+        assert!(app.notice.as_deref().unwrap().contains("cannot be saved"));
     }
 
     #[tokio::test]

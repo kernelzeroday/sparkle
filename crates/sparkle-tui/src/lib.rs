@@ -3,6 +3,7 @@
 pub mod anim;
 pub mod app;
 pub mod markdown;
+pub mod picker;
 pub mod theme;
 pub mod view;
 

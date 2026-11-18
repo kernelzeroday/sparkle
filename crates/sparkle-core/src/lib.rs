@@ -5,6 +5,7 @@ pub mod config;
 pub mod context;
 pub mod error;
 pub mod extract;
+pub mod library;
 pub mod openai;
 pub mod personas;
 pub mod prefill;
