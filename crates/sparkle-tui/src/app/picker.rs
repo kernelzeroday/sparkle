@@ -100,7 +100,9 @@ impl App {
         let file = library::expand_home(path);
         let loaded = library::load_file(&file).map_err(|error| error.to_string())?;
         self.apply_prompt(loaded);
-        if make_default {
+        if !make_default {
+            self.remember_prompt(Some(&file.to_string_lossy()));
+        } else {
             // Saving replaces the notice, so a size warning has to be carried across.
             let warning = self.context_warning();
             let absolute = file.canonicalize().map_err(|error| error.to_string())?;

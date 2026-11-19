@@ -7,6 +7,9 @@ use crate::picker::Picker;
 
 use sparkle_core::journal;
 
+/// Where text set with /system is kept so that new chats can start with it.
+const CUSTOM_PROMPT_FILE: &str = "custom_prompt.md";
+
 use super::{Action, App, COMMANDS, EFFORTS, Turn, new_input};
 
 impl App {
@@ -115,6 +118,7 @@ impl App {
                     if self.system.is_some() { "System prompt set" } else { "System prompt cleared" }
                         .into(),
                 );
+                self.remember_custom_prompt(argument);
             }
             "/prefill" => {
                 self.prefill = (!argument.is_empty()).then(|| argument.to_string());
@@ -154,11 +158,13 @@ impl App {
             self.system = None;
             self.measured_context = None;
             self.notice = Some("Persona cleared".into());
+            self.remember_prompt(None);
         } else if let Some(persona) = personas::find(name) {
             self.persona = Some(persona.name.to_string());
             self.system = Some(persona.prompt.to_string());
             self.measured_context = None;
             self.notice = Some(format!("Persona: {}", persona.name));
+            self.remember_prompt(Some(persona.name));
         } else {
             self.notice = Some(format!("Unknown persona '{name}'"));
         }
@@ -222,12 +228,54 @@ impl App {
             self.system = None;
             self.measured_context = None;
             self.notice = Some("System prompt cleared".into());
+            self.remember_prompt(None);
             return Ok(());
         }
         let pack = self.prompt_pack.as_deref();
         let loaded = library::load(name, pack).map_err(|error| error.to_string())?;
         self.apply_prompt(loaded);
+        self.remember_prompt(Some(name));
         Ok(())
+    }
+
+    /// Makes the prompt just chosen the one new chats start with, so a choice lasts between
+    /// sessions; `None` means the chat now has none. Only a failure is worth a notice.
+    pub(super) fn remember_prompt(&mut self, name: Option<&str>) {
+        let Some(file) = self.default_prompt_file.clone() else { return };
+        let stored = match name {
+            Some(name) => match library::storable_name(name, self.prompt_pack.as_deref()) {
+                Ok(stored) => Some(stored),
+                Err(error) => {
+                    self.notice = Some(format!("Could not remember the prompt: {error}"));
+                    return;
+                }
+            },
+            None => None,
+        };
+        if stored == self.default_prompt {
+            return;
+        }
+        match library::save_default(&file, stored.as_deref()) {
+            Ok(()) => self.default_prompt = stored,
+            Err(error) => self.notice = Some(format!("Could not remember the prompt: {error}")),
+        }
+    }
+
+    /// Text typed with /system has no name to remember, so it is kept in a file beside the
+    /// saved default and that file is remembered instead.
+    fn remember_custom_prompt(&mut self, text: &str) {
+        if text.is_empty() {
+            self.remember_prompt(None);
+            return;
+        }
+        let Some(dir) = self.default_prompt_file.as_ref().and_then(|file| file.parent()) else {
+            return;
+        };
+        let file = dir.join(CUSTOM_PROMPT_FILE);
+        match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&file, text)) {
+            Ok(()) => self.remember_prompt(Some(&file.to_string_lossy())),
+            Err(error) => self.notice = Some(format!("Could not remember the prompt: {error}")),
+        }
     }
 
     pub(super) fn apply_prompt(&mut self, loaded: library::Loaded) {

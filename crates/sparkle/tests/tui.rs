@@ -436,6 +436,35 @@ fn a_default_chosen_in_the_browser_starts_the_next_chat() {
 }
 
 #[test]
+fn the_prompt_chosen_in_a_chat_starts_the_next_one() {
+    let harness = Harness::new();
+    let mut tui = Tui::open(&harness, &[]);
+    tui.command("/prompts openai/gpt-3.5");
+    tui.wait_for("System prompt: openai/gpt-3.5");
+    tui.quit();
+
+    let mut next = Tui::open(&harness, &[]);
+    next.wait_for("System prompt: openai/gpt-3.5");
+    next.command("/system Answer in haiku");
+    next.wait_for("System prompt set");
+    next.quit();
+
+    let mut third = Tui::open(&harness, &[]);
+    third.wait_for("System prompt: custom_prompt.md");
+    third.ask(&harness, "hello");
+    third.wait_for("Hello world");
+    assert_eq!(harness.last_body()["messages"][0]["content"], "Answer in haiku");
+    third.command("/prompts off");
+    third.wait_for("System prompt cleared");
+    third.quit();
+
+    let mut fourth = Tui::open(&harness, &[]);
+    fourth.wait_for("Chatting with mock");
+    assert!(!fourth.screen().contains("System prompt:"), "{}", fourth.screen());
+    fourth.quit();
+}
+
+#[test]
 fn the_prompt_browser_loads_an_external_file() {
     let harness = Harness::new();
     let path = harness.write_file("house-style.md", "Use the house style.");

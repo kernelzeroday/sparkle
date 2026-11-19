@@ -86,8 +86,8 @@ first Claude 3 and Gemini prompts through current releases. Open the browser wit
 | type | Filter by name |
 | `↑`, `↓`, `pgup`, `pgdn` | Move through the list |
 | `←`, `→` | Switch vendor |
-| `enter` | Use the highlighted prompt |
-| `ctrl+d` | Make it the default for new chats, or press again to remove the default |
+| `enter` | Use the highlighted prompt, and start new chats with it too |
+| `ctrl+d` | Make it the default for new chats without using it now, or press again to remove it |
 | `ctrl+o` | Choose an external file, with `tab` to complete paths |
 | `esc` | Close |
 
@@ -118,6 +118,9 @@ sparkle prompts default off
 ```
 
 In a chat, use `/prompts NAME`, `/prompts off`, `/prompts file PATH` and `/prompts default NAME`.
+The prompt you choose in a chat, by any of these, `/persona` or `/system TEXT`, is remembered and
+new chats start with it; turning it off forgets it. Text set with `/system` is kept in
+`custom_prompt.md` in the config folder. Prompts given on the command line apply to that run only.
 An explicit `--system`, `--system-prompt` or `--persona` takes priority over the default, and a
 continued conversation keeps the system prompt it started with.
 

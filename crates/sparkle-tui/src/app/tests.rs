@@ -1444,3 +1444,50 @@ async fn without_a_journal_the_system_prompt_is_unchanged() {
     say(&mut app, &mut receiver, "hi").await;
     assert_eq!(provider.requests.lock().unwrap()[0].messages[0].content, "Be kind");
 }
+
+#[tokio::test]
+async fn choosing_a_prompt_remembers_it_for_new_chats_and_turning_it_off_forgets() {
+    let (mut app, mut receiver, _provider) = app_with(Vec::new(), None);
+    let file = default_file("remember");
+    app.default_prompt_file = Some(file.clone());
+
+    // From the browser.
+    app.prompts_command("");
+    app.picker.as_mut().unwrap().push_filter("gpt-3.5");
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(library::saved_default(&file).as_deref(), Some("openai/gpt-3.5"));
+    assert!(app.notice.as_deref().unwrap().starts_with("System prompt: openai/gpt-3.5"));
+
+    // By name, and as a persona.
+    say(&mut app, &mut receiver, "/prompts concise").await;
+    assert_eq!(library::saved_default(&file).as_deref(), Some("concise"));
+    say(&mut app, &mut receiver, "/persona socratic").await;
+    assert_eq!(library::saved_default(&file).as_deref(), Some("socratic"));
+
+    // Typed text is kept in a file beside the default, and that file is remembered.
+    say(&mut app, &mut receiver, "/system Answer in haiku").await;
+    let saved = library::saved_default(&file).unwrap();
+    assert!(saved.ends_with("custom_prompt.md"), "{saved}");
+    assert_eq!(std::fs::read_to_string(&saved).unwrap(), "Answer in haiku");
+    assert_eq!(library::load(&saved, None).unwrap().text, "Answer in haiku");
+
+    // Each way of turning the prompt off forgets it.
+    for off in ["/prompts off", "/persona off", "/system"] {
+        say(&mut app, &mut receiver, "/persona socratic").await;
+        say(&mut app, &mut receiver, off).await;
+        assert_eq!(library::saved_default(&file), None, "{off}");
+    }
+}
+
+#[tokio::test]
+async fn a_prompt_file_chosen_in_the_chat_is_remembered_by_its_full_path() {
+    let (mut app, mut receiver, _provider) = app_with(Vec::new(), None);
+    let file = default_file("remember-file");
+    app.default_prompt_file = Some(file.clone());
+    let prompt = file.parent().unwrap().join("mine.md");
+    std::fs::create_dir_all(prompt.parent().unwrap()).unwrap();
+    std::fs::write(&prompt, "Mine").unwrap();
+    say(&mut app, &mut receiver, &format!("/prompts file {}", prompt.display())).await;
+    let saved = library::saved_default(&file).unwrap();
+    assert_eq!(std::path::Path::new(&saved), prompt.canonicalize().unwrap());
+}
