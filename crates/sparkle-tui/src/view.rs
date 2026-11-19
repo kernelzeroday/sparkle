@@ -61,8 +61,11 @@ fn reply_stats(turn: &Turn) -> String {
     if let Some(duration) = turn.duration_ms {
         parts.push(seconds(duration));
     }
-    if turn.journaled > 0 {
+    if turn.journaled.kept > 0 {
         parts.push("✎ noted".to_string());
+    }
+    if turn.journaled.let_go > 0 {
+        parts.push("✎ let go".to_string());
     }
     parts.join(" · ")
 }
@@ -1124,7 +1127,7 @@ mod tests {
         let screen = screen(&mut app, 80, 24);
         assert!(screen.contains("Glad to help.") && screen.contains("Anything else?"), "{screen}");
         assert!(!screen.contains("journal") && !screen.contains("parser"), "{screen}");
-        assert!(screen.contains("✎ noted"), "{screen}");
+        assert!(screen.contains("✎ noted") && !screen.contains("let go"), "{screen}");
         journal.clear().unwrap();
     }
 

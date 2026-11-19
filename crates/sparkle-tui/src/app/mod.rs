@@ -122,8 +122,8 @@ pub struct Turn {
     pub summary: bool,
     /// Method and token counts recorded when this turn compacted earlier history.
     pub compaction: Option<CompactionInfo>,
-    /// How many journal notes this reply kept or let go.
-    pub journaled: usize,
+    /// What this reply did to the journal.
+    pub journaled: journal::Applied,
     pub cache: Option<(u16, bool, Vec<Line<'static>>)>,
 }
 
@@ -947,10 +947,9 @@ impl App {
         if actions.is_empty() {
             return;
         }
-        let numbered = self.journal_opening.as_ref().map_or(&[][..], |opening| &opening.ids);
-        match journal.apply(&actions, numbered, Some(&turn.model)) {
-            Ok(count) => {
-                turn.journaled = count;
+        match journal.apply(&actions, Some(&turn.model)) {
+            Ok(applied) => {
+                turn.journaled = applied;
                 turn.cache = None;
             }
             Err(error) => self.notice = Some(format!("Could not save to the journal: {error}")),

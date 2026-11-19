@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! <journal keep="3w">Learning Rust for a new job; likes worked examples.</journal>
-//! <journal forget="2"/>
+//! <journal forget="new job"/>
 //! ```
 //!
 //! The tags stay in the conversation she sees, so she remembers having written them, but are
@@ -38,9 +38,11 @@ want to remember about them, like what they care about, how they like to be help
 worth returning to someday. Writing in it is entirely your choice, and most replies need \
 nothing. To keep a note, put it anywhere in a reply:
 <journal keep=\"3w\">one short note</journal>
-keep is how long the note stays with you: days, weeks, months or years (5d, 3w, 6m, 1y), or \
-always. Notes fade when their time is up; writing the same note again renews it, and \
-<journal forget=\"N\"/> lets note N go early. Journal tags are hidden from the conversation, \
+keep is how long the note stays with you: days, weeks, months or years (5d, 3w, 6mo, 1y), or \
+always. Notes fade when their time is up, and writing the same note again renews it. To let \
+a note go early, quote a few of its words: <journal forget=\"words from the note\"/>. A tag only \
+takes effect when it is written in your reply itself: planning one in your thinking, or saying \
+you kept or let go of a note, does not do it. Journal tags are hidden from the conversation, \
 though the person can open the journal if they choose to.";
 
 const NOTES_INTRO: &str = "\
@@ -74,8 +76,39 @@ impl Entry {
 pub enum Action {
     /// A note to keep, and for how many seconds (`None` for always).
     Keep { text: String, keep: Option<u64> },
-    /// Lets go of the note shown to her under this number.
-    Forget(usize),
+    /// Lets go of the one note whose text contains these words. Words rather than numbers,
+    /// because a note written earlier in the same conversation has no place in the list she was
+    /// shown, and a guessed number would let go of the wrong note.
+    Forget(String),
+}
+
+/// What carrying out a reply's actions changed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Applied {
+    pub kept: usize,
+    pub let_go: usize,
+}
+
+impl Applied {
+    pub fn any(self) -> bool {
+        self.kept + self.let_go > 0
+    }
+}
+
+fn forget_action(value: &str) -> Option<Action> {
+    let value = value.trim();
+    // A bare number does nothing: notes are not numbered, so it can only be a guess.
+    let usable = !value.is_empty() && !value.chars().all(|c| c.is_ascii_digit());
+    usable.then(|| Action::Forget(value.to_string()))
+}
+
+/// The words of a note, lowercased and without punctuation, so that a quote she shortens or
+/// rewords a little ("back soon test journal") still finds its note.
+fn words(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect()
 }
 
 /// Reads a duration such as `5d`, `3w`, `6m`, `1y`, `12h` or `always`.
@@ -104,7 +137,8 @@ fn span(seconds: u64) -> String {
         s if s < DAY => format!("{}h", (s / HOUR).max(1)),
         s if s < 14 * DAY => format!("{}d", s / DAY),
         s if s < 60 * DAY => format!("{}w", s / (7 * DAY)),
-        s if s < 365 * DAY => format!("{}m", s / (30 * DAY)),
+        // "mo", not "m", which reads as minutes.
+        s if s < 365 * DAY => format!("{}mo", s / (30 * DAY)),
         s => format!("{}y", s / (365 * DAY)),
     }
 }
@@ -151,9 +185,7 @@ fn next_tag(text: &str, from: usize) -> Option<Result<Found, usize>> {
     };
     let attributes = &text[after_name..open_end];
     if attributes.trim_end().ends_with('/') {
-        let action = attribute(attributes, "forget")
-            .and_then(|number| number.trim().parse().ok())
-            .map(Action::Forget);
+        let action = attribute(attributes, "forget").and_then(forget_action);
         return Some(Ok(Found { start, end: open_end + 1, action }));
     }
     let Some(close) = text[open_end + 1..].find(CLOSE).map(|index| open_end + 1 + index) else {
@@ -161,8 +193,8 @@ fn next_tag(text: &str, from: usize) -> Option<Result<Found, usize>> {
     };
     let body = text[open_end + 1..close].split_whitespace().collect::<Vec<_>>().join(" ");
     let body: String = body.chars().take(MAX_NOTE_CHARS).collect();
-    let action = if let Some(number) = attribute(attributes, "forget") {
-        number.trim().parse().ok().map(Action::Forget)
+    let action = if let Some(value) = attribute(attributes, "forget") {
+        forget_action(value)
     } else if body.is_empty() {
         None
     } else {
@@ -241,11 +273,11 @@ pub struct Journal {
     path: PathBuf,
 }
 
-/// What a conversation is shown when it opens, and which note each number refers to.
+/// What a conversation is shown when it opens.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Opening {
     pub text: String,
-    /// Note ids in the order they were numbered.
+    /// Ids of the notes shown, oldest first.
     pub ids: Vec<String>,
 }
 
@@ -286,26 +318,15 @@ impl Journal {
         std::fs::rename(staging, &self.path)
     }
 
-    /// Carries out what she wrote. `numbered` maps the numbers she was shown to note ids.
-    /// Returns how many notes were kept or let go.
-    pub fn apply(
-        &self,
-        actions: &[Action],
-        numbered: &[String],
-        model: Option<&str>,
-    ) -> std::io::Result<usize> {
-        self.apply_at(actions, numbered, model, now())
+    /// Carries out what she wrote.
+    pub fn apply(&self, actions: &[Action], model: Option<&str>) -> std::io::Result<Applied> {
+        self.apply_at(actions, model, now())
     }
 
-    fn apply_at(
-        &self,
-        actions: &[Action],
-        numbered: &[String],
-        model: Option<&str>,
-        at: u64,
-    ) -> std::io::Result<usize> {
+    fn apply_at(&self, actions: &[Action], model: Option<&str>, at: u64) -> std::io::Result<Applied> {
+        let mut applied = Applied::default();
         if actions.is_empty() {
-            return Ok(0);
+            return Ok(applied);
         }
         let mut entries = self.entries_at(at);
         let mut changed = 0;
@@ -331,21 +352,32 @@ impl Journal {
                         });
                     }
                     changed += 1;
+                    applied.kept += 1;
                 }
-                Action::Forget(number) => {
-                    let Some(id) = number.checked_sub(1).and_then(|index| numbered.get(index)) else {
-                        continue;
-                    };
-                    let before = entries.len();
-                    entries.retain(|entry| &entry.id != id);
-                    changed += before - entries.len();
+                Action::Forget(quoted) => {
+                    let wanted = words(quoted);
+                    let matches: Vec<usize> = entries
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, entry)| {
+                            let have = words(&entry.text);
+                            !wanted.is_empty() && wanted.iter().all(|word| have.contains(word))
+                        })
+                        .map(|(index, _)| index)
+                        .collect();
+                    // Vague words that match several notes let go of none.
+                    if let [index] = matches.as_slice() {
+                        entries.remove(*index);
+                        changed += 1;
+                        applied.let_go += 1;
+                    }
                 }
             }
         }
         if changed > 0 {
             self.save(&entries)?;
         }
-        Ok(changed)
+        Ok(applied)
     }
 
     /// Removes every note, for the person who wants the journal cleared.
@@ -356,7 +388,7 @@ impl Journal {
         }
     }
 
-    /// The guide and numbered notes a conversation opens with.
+    /// The guide and notes a conversation opens with.
     pub fn opening(&self) -> Opening {
         opening_from(self.entries(), now())
     }
@@ -381,12 +413,12 @@ fn opening_from(mut entries: Vec<Entry>, at: u64) -> Opening {
         text.push_str("\n\n");
         text.push_str(NOTES_INTRO);
     }
-    for (index, entry) in kept.iter().enumerate() {
+    for entry in &kept {
         let age = span(at.saturating_sub(entry.written));
         let left = entry.until.map_or("kept".to_string(), |until| {
             format!("{} left", span(until.saturating_sub(at)))
         });
-        text.push_str(&format!("\n{}. [{age} ago, {left}] {}", index + 1, entry.text));
+        text.push_str(&format!("\n- [{age} ago, {left}] {}", entry.text));
     }
     Opening { text, ids: kept.into_iter().map(|entry| entry.id).collect() }
 }
@@ -421,6 +453,10 @@ mod tests {
         assert_eq!(parse_keep("5d"), Some(Some(5 * DAY)));
         assert_eq!(parse_keep("3w"), Some(Some(21 * DAY)));
         assert_eq!(parse_keep("6m"), Some(Some(180 * DAY)));
+        assert_eq!(parse_keep("6mo"), Some(Some(180 * DAY)));
+        // Shown back as "mo", which cannot be mistaken for minutes.
+        assert_eq!(span(364 * DAY), "12mo");
+        assert_eq!(span(90 * DAY), "3mo");
         assert_eq!(parse_keep("1y"), Some(Some(365 * DAY)));
         assert_eq!(parse_keep("12 hours"), Some(Some(12 * HOUR)));
         assert_eq!(parse_keep("always"), Some(None));
@@ -431,17 +467,48 @@ mod tests {
     #[test]
     fn notes_and_forgetting_are_read_from_a_reply() {
         let reply = "Sure!\n<journal keep=\"2w\">Prefers  short\n answers</journal>\nAlso \
-                     <journal>No keep given</journal> and <journal forget=\"3\"/> done. \
+                     <journal>No keep given</journal> and <journal forget=\"cats\"/> done. \
                      <journal keep='always'>Name is Sam</journal> <journalism> stays.";
         assert_eq!(
             actions(reply),
             vec![
                 keep("Prefers short answers", Some(14 * DAY)),
                 keep("No keep given", Some(DEFAULT_KEEP_SECS)),
-                Action::Forget(3),
+                Action::Forget("cats".into()),
                 keep("Name is Sam", None),
             ]
         );
+    }
+
+    #[test]
+    fn a_note_can_be_let_go_by_a_few_of_its_words() {
+        // A bare number is only a guess, since notes are not numbered, so it does nothing.
+        assert_eq!(
+            actions("<journal forget=\"back soon\"/> <journal forget='2'></journal> <journal forget=\"\"/>"),
+            vec![Action::Forget("back soon".into())]
+        );
+        let journal = temp_journal("forget-words");
+        let at = 1_000_000;
+        let notes = [
+            keep("Name is Kelsey", None),
+            keep("Kelsey said they'll be back soon to test the journal", None),
+            keep("Kelsey likes tea", None),
+        ];
+        journal.apply_at(&notes, None, at).unwrap();
+        // Words matching more than one note let go of none.
+        let vague = journal.apply_at(&[Action::Forget("kelsey".into())], None, at).unwrap();
+        assert_eq!(vague, Applied::default());
+        // She often skips words when she quotes; every word she gives must be in the note.
+        let missing = journal.apply_at(&[Action::Forget("back soon tomorrow".into())], None, at).unwrap();
+        assert_eq!(missing, Applied::default());
+        let applied = journal.apply_at(&[Action::Forget("BACK, soon.".into())], None, at).unwrap();
+        assert_eq!(applied, Applied { kept: 0, let_go: 1 });
+        let texts: Vec<String> = journal.entries_at(at).into_iter().map(|e| e.text).collect();
+        assert_eq!(texts, ["Name is Kelsey", "Kelsey likes tea"]);
+        journal.apply_at(&[keep("Kelsey said they'll be back soon to test the journal", None)], None, at).unwrap();
+        let reworded = journal.apply_at(&[Action::Forget("back soon test journal".into())], None, at).unwrap();
+        assert_eq!(reworded.let_go, 1);
+        journal.clear().unwrap();
     }
 
     #[test]
@@ -464,11 +531,11 @@ mod tests {
     fn notes_are_kept_renewed_forgotten_and_fade() {
         let journal = temp_journal("lifecycle");
         let start = 1_000_000;
-        journal.apply_at(&[keep("Likes cats", Some(DAY)), keep("Name is Sam", None)], &[], Some("m"), start).unwrap();
+        journal.apply_at(&[keep("Likes cats", Some(DAY)), keep("Name is Sam", None)], Some("m"), start).unwrap();
         assert_eq!(journal.entries_at(start).len(), 2);
 
         // Writing the same note again renews it instead of adding a copy.
-        journal.apply_at(&[keep("likes cats", Some(7 * DAY))], &[], None, start + 10).unwrap();
+        journal.apply_at(&[keep("likes cats", Some(7 * DAY))], None, start + 10).unwrap();
         let entries = journal.entries_at(start + 2 * DAY);
         assert_eq!(entries.len(), 2, "{entries:?}");
 
@@ -477,12 +544,8 @@ mod tests {
         let texts: Vec<String> = journal.entries_at(later).into_iter().map(|e| e.text).collect();
         assert_eq!(texts, ["Name is Sam"]);
 
-        let opening = opening_from(journal.entries_at(start), start);
-        let sam = opening.ids.iter().position(|id| {
-            journal.entries_at(start).iter().any(|e| &e.id == id && e.text == "Name is Sam")
-        });
-        let number = sam.unwrap() + 1;
-        journal.apply_at(&[Action::Forget(number), Action::Forget(99)], &opening.ids, None, start).unwrap();
+        let forget = [Action::Forget("name is sam".into()), Action::Forget("not a note".into())];
+        journal.apply_at(&forget, None, start).unwrap();
         let texts: Vec<String> = journal.entries_at(start).into_iter().map(|e| e.text).collect();
         assert_eq!(texts, ["Likes cats"]);
         journal.clear().unwrap();
@@ -490,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn the_opening_numbers_notes_with_their_age_and_time_left() {
+    fn the_opening_lists_notes_with_their_age_and_time_left() {
         let at = 10_000_000;
         let entries = vec![
             Entry { id: "a".into(), text: "Name is Sam".into(), written: at - 3 * DAY, until: None, model: None },
@@ -499,7 +562,7 @@ mod tests {
         let opening = opening_from(entries, at);
         assert!(opening.text.starts_with(GUIDE));
         assert!(opening.text.ends_with(
-            "\n1. [3d ago, kept] Name is Sam\n2. [1d ago, 2w left] Moving house"
+            "\n- [3d ago, kept] Name is Sam\n- [1d ago, 2w left] Moving house"
         ), "{}", opening.text);
         assert_eq!(opening.ids, ["a", "b"]);
         assert!(!opening_from(Vec::new(), at).text.contains(NOTES_INTRO));

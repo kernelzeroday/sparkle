@@ -1378,7 +1378,7 @@ async fn the_model_keeps_notes_without_them_showing_in_the_chat() {
     assert_eq!(entries.len(), 1);
     assert_eq!((entries[0].text.as_str(), entries[0].until), ("Their name is Sam", None));
     assert_eq!(entries[0].model.as_deref(), Some("mock"));
-    assert_eq!(app.turns.last().unwrap().journaled, 1);
+    assert_eq!(app.turns.last().unwrap().journaled, journal::Applied { kept: 1, let_go: 0 });
     // The model still sees what she wrote, so she knows the note is kept.
     assert!(app.turns.last().unwrap().text.contains("<journal"));
     journal.clear().unwrap();
@@ -1400,22 +1400,35 @@ async fn the_journal_stays_put_during_a_conversation_and_refreshes_on_new() {
     say(&mut app, &mut receiver, "hello again").await;
     let requests = provider.requests.lock().unwrap();
     let opening = &requests[2].messages[0].content;
-    assert!(opening.contains("\n1. [") && opening.contains("2w left] Likes tea"), "{opening}");
+    assert!(opening.contains("\n- [") && opening.contains("2w left] Likes tea"), "{opening}");
     assert_eq!(journal.entries().len(), 1, "writing the same note again renews it");
     journal.clear().unwrap();
 }
 
 #[tokio::test]
-async fn the_model_can_let_a_note_go_by_its_number() {
+async fn the_model_can_let_a_note_go_by_quoting_it() {
     let (mut app, mut receiver, provider) = app_with(Vec::new(), None);
     let journal = with_journal(&mut app, "forget");
     let keep = |text: &str| journal::Action::Keep { text: text.into(), keep: None };
-    journal.apply(&[keep("first"), keep("second")], &[], None).unwrap();
+    journal.apply(&[keep("Their name is Kelsey"), keep("Back soon to test the journal")], None).unwrap();
     app.reopen_journal();
+    // A guessed number does nothing; quoting the note lets it go and marks the reply.
     provider.queue(noting("Sure. <journal forget=\"1\"/>"));
-    say(&mut app, &mut receiver, "forget the first thing").await;
+    say(&mut app, &mut receiver, "remove the test note").await;
+    assert_eq!(journal.entries().len(), 2);
+    assert!(!app.turns.last().unwrap().journaled.any());
+    provider.queue(noting("Done. <journal forget=\"test the journal\"/>"));
+    say(&mut app, &mut receiver, "remove the test note").await;
     let texts: Vec<String> = journal.entries().into_iter().map(|entry| entry.text).collect();
-    assert_eq!(texts, ["second"]);
+    assert_eq!(texts, ["Their name is Kelsey"]);
+    assert_eq!(app.turns.last().unwrap().journaled, journal::Applied { kept: 0, let_go: 1 });
+
+    // A note written earlier in the same conversation can be let go the same way.
+    provider.queue(noting("Okay. <journal keep=\"1w\">Kelsey is at a café</journal>"));
+    say(&mut app, &mut receiver, "I'm at a café").await;
+    provider.queue(noting("Removed. <journal forget=\"at a café\"/>"));
+    say(&mut app, &mut receiver, "never mind, remove that").await;
+    assert_eq!(journal.entries().len(), 1);
     journal.clear().unwrap();
 }
 
@@ -1429,7 +1442,7 @@ async fn the_person_can_read_and_clear_the_journal() {
     say(&mut app, &mut receiver, "/journal").await;
     assert_eq!(app.turns.last().unwrap().text, "The journal is empty");
     let keep = journal::Action::Keep { text: "Likes tea".into(), keep: Some(86_400 * 7) };
-    journal.apply(&[keep], &[], None).unwrap();
+    journal.apply(&[keep], None).unwrap();
     say(&mut app, &mut receiver, "/journal").await;
     let listing = &app.turns.last().unwrap().text;
     assert!(listing.contains("1 notes") || listing.contains("Journal, 1"), "{listing}");
