@@ -5,7 +5,7 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use sparkle_core::{Message, Role, Usage};
+use sparkle_core::{Attachment, Message, Role, Usage};
 use rusqlite::{Connection, OptionalExtension, params};
 use ulid::Ulid;
 
@@ -38,6 +38,24 @@ const MIGRATIONS: &[&str] = &[
 ",
     // Set on a compaction summary, pointing at the tip of the branch it replaced.
     "ALTER TABLE messages ADD COLUMN compacted_from TEXT REFERENCES messages(id);",
+    // Attachments sent alongside a message (URLs or inline base64 payloads).
+    "
+    CREATE TABLE message_attachments (
+        id TEXT PRIMARY KEY,
+        message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        ord INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        mime TEXT,
+        data TEXT NOT NULL
+    );
+    CREATE INDEX message_attachments_message ON message_attachments(message_id, ord);
+",
+    // Metadata recorded on inline compaction entries for display and resume.
+    "
+    ALTER TABLE messages ADD COLUMN compaction_method TEXT;
+    ALTER TABLE messages ADD COLUMN compaction_tokens_before INTEGER;
+    ALTER TABLE messages ADD COLUMN compaction_tokens_after INTEGER;
+",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,19 +68,44 @@ pub struct ConversationSummary {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactionInfo {
+    pub method: String,
+    pub tokens_before: u64,
+    pub tokens_after: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredMessage {
     pub id: String,
     pub role: Role,
     pub content: String,
     pub reasoning: Option<String>,
-    /// For a compaction summary, the last message of the branch it replaced.
+    pub attachments: Vec<Attachment>,
+    /// For a compaction summary, the last message before compaction took effect.
     pub compacted_from: Option<String>,
+    /// Method and token counts recorded when this entry compacted earlier turns.
+    pub compaction: Option<CompactionInfo>,
 }
 
 impl StoredMessage {
-    pub fn to_message(&self) -> Message {
-        Message::new(self.role, self.content.clone())
+    pub fn is_compaction(&self) -> bool {
+        self.compaction.is_some() || self.compacted_from.is_some()
     }
+
+    pub fn to_message(&self) -> Message {
+        Message {
+            role: self.role,
+            content: self.content.clone(),
+            attachments: self.attachments.clone(),
+        }
+    }
+}
+
+/// Returns the non-system messages that belong in the active LLM context (starting at the latest
+/// compaction boundary, if any).
+pub fn active_context(history: &[StoredMessage]) -> Vec<&StoredMessage> {
+    let start = history.iter().rposition(StoredMessage::is_compaction).unwrap_or(0);
+    history[start..].iter().filter(|message| message.role != Role::System).collect()
 }
 
 /// Everything recorded about a message being appended.
@@ -72,6 +115,7 @@ pub struct NewMessage<'a> {
     pub role: Role,
     pub content: &'a str,
     pub reasoning: Option<&'a str>,
+    pub attachments: &'a [Attachment],
     pub model: Option<&'a str>,
     pub usage: Option<Usage>,
     pub duration_ms: Option<u64>,
@@ -79,7 +123,16 @@ pub struct NewMessage<'a> {
 
 impl<'a> NewMessage<'a> {
     pub fn plain(parent_id: Option<&'a str>, role: Role, content: &'a str) -> Self {
-        Self { parent_id, role, content, reasoning: None, model: None, usage: None, duration_ms: None }
+        Self {
+            parent_id,
+            role,
+            content,
+            reasoning: None,
+            attachments: &[],
+            model: None,
+            usage: None,
+            duration_ms: None,
+        }
     }
 }
 
@@ -130,7 +183,26 @@ impl Store {
 
     /// Appends a message and makes it the conversation's current tip.
     pub fn append(&self, conversation_id: &str, message: NewMessage<'_>) -> Result<String> {
-        self.insert(conversation_id, message, None)
+        let transaction = self.connection.unchecked_transaction()?;
+        let id = self.insert(conversation_id, message, None, None)?;
+        transaction.commit()?;
+        Ok(id)
+    }
+
+    /// Appends an inline compaction entry onto the active branch. Prior messages stay on the same
+    /// branch so the display transcript remains intact across resume, while LLM context resets at
+    /// this entry.
+    pub fn append_compaction(
+        &self,
+        conversation_id: &str,
+        summary: NewMessage<'_>,
+        compacted_from: &str,
+        info: &CompactionInfo,
+    ) -> Result<String> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let id = self.insert(conversation_id, summary, Some(compacted_from), Some(info))?;
+        transaction.commit()?;
+        Ok(id)
     }
 
     /// Starts a new branch from a summary of the branch ending at `compacted_from`, followed by
@@ -144,11 +216,16 @@ impl Store {
         kept: &[NewMessage<'_>],
     ) -> Result<(String, Vec<String>)> {
         let transaction = self.connection.unchecked_transaction()?;
-        let summary_id = self.insert(conversation_id, summary, Some(compacted_from))?;
+        let summary_id = self.insert(conversation_id, summary, Some(compacted_from), None)?;
         let mut kept_ids: Vec<String> = Vec::with_capacity(kept.len());
         for message in kept {
             let parent_id = Some(kept_ids.last().unwrap_or(&summary_id).as_str());
-            kept_ids.push(self.insert(conversation_id, NewMessage { parent_id, ..*message }, None)?);
+            kept_ids.push(self.insert(
+                conversation_id,
+                NewMessage { parent_id, ..*message },
+                None,
+                None,
+            )?);
         }
         transaction.commit()?;
         Ok((summary_id, kept_ids))
@@ -159,13 +236,15 @@ impl Store {
         conversation_id: &str,
         message: NewMessage<'_>,
         compacted_from: Option<&str>,
+        compaction: Option<&CompactionInfo>,
     ) -> Result<String> {
         let id = Ulid::generate().to_string().to_lowercase();
         self.connection.execute(
             "INSERT INTO messages (id, conversation_id, parent_id, role, content, reasoning, model,
                                    input_tokens, output_tokens, duration_ms, created_ms,
-                                   compacted_from)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                                   compacted_from, compaction_method, compaction_tokens_before,
+                                   compaction_tokens_after)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 id,
                 conversation_id,
@@ -179,8 +258,23 @@ impl Store {
                 message.duration_ms.map(|value| value as i64),
                 now_ms(),
                 compacted_from,
+                compaction.map(|info| info.method.as_str()),
+                compaction.map(|info| info.tokens_before as i64),
+                compaction.map(|info| info.tokens_after as i64),
             ],
         )?;
+        for (ord, attachment) in message.attachments.iter().enumerate() {
+            let attachment_id = Ulid::generate().to_string().to_lowercase();
+            let (kind, mime, data) = match attachment {
+                Attachment::Url(url) => ("url", None, url.as_str()),
+                Attachment::Inline { mime, base64 } => ("inline", Some(mime.as_str()), base64.as_str()),
+            };
+            self.connection.execute(
+                "INSERT INTO message_attachments (id, message_id, ord, kind, mime, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![attachment_id, id, ord as i64, kind, mime, data],
+            )?;
+        }
         self.set_tip(conversation_id, &id)?;
         Ok(id)
     }
@@ -223,31 +317,74 @@ impl Store {
             .optional()
     }
 
+    fn attachments_for(&self, message_id: &str) -> Result<Vec<Attachment>> {
+        let mut statement = self.connection.prepare(
+            "SELECT kind, mime, data FROM message_attachments
+             WHERE message_id = ?1 ORDER BY ord ASC",
+        )?;
+        let rows = statement.query_map([message_id], |row| {
+            let kind: String = row.get(0)?;
+            let mime: Option<String> = row.get(1)?;
+            let data: String = row.get(2)?;
+            Ok(match kind.as_str() {
+                "url" => Attachment::Url(data),
+                _ => Attachment::Inline {
+                    mime: mime.unwrap_or_else(|| "application/octet-stream".to_string()),
+                    base64: data,
+                },
+            })
+        })?;
+        rows.collect()
+    }
+
     /// Returns the active branch from root to tip.
     pub fn thread(&self, conversation_id: &str) -> Result<Vec<StoredMessage>> {
         let mut statement = self.connection.prepare(
-            "WITH RECURSIVE branch(id, parent_id, role, content, reasoning, compacted_from, depth) AS (
-                 SELECT m.id, m.parent_id, m.role, m.content, m.reasoning, m.compacted_from, 0
+            "WITH RECURSIVE branch(
+                 id, parent_id, role, content, reasoning, compacted_from,
+                 compaction_method, compaction_tokens_before, compaction_tokens_after, depth
+             ) AS (
+                 SELECT m.id, m.parent_id, m.role, m.content, m.reasoning, m.compacted_from,
+                        m.compaction_method, m.compaction_tokens_before, m.compaction_tokens_after, 0
                  FROM messages m JOIN conversations c ON c.tip_id = m.id
                  WHERE c.id = ?1
                  UNION ALL
                  SELECT m.id, m.parent_id, m.role, m.content, m.reasoning, m.compacted_from,
+                        m.compaction_method, m.compaction_tokens_before, m.compaction_tokens_after,
                         branch.depth + 1
                  FROM messages m JOIN branch ON m.id = branch.parent_id
              )
-             SELECT id, role, content, reasoning, compacted_from FROM branch ORDER BY depth DESC",
+             SELECT id, role, content, reasoning, compacted_from,
+                    compaction_method, compaction_tokens_before, compaction_tokens_after
+             FROM branch ORDER BY depth DESC",
         )?;
-        let rows = statement.query_map([conversation_id], |row| {
-            let role: String = row.get(1)?;
-            Ok(StoredMessage {
-                id: row.get(0)?,
-                role: Role::parse(&role).unwrap_or(Role::User),
-                content: row.get(2)?,
-                reasoning: row.get(3)?,
-                compacted_from: row.get(4)?,
-            })
-        })?;
-        rows.collect()
+        let mut messages: Vec<StoredMessage> = statement
+            .query_map([conversation_id], |row| {
+                let role: String = row.get(1)?;
+                let compacted_from: Option<String> = row.get(4)?;
+                let method: Option<String> = row.get(5)?;
+                let tokens_before: Option<i64> = row.get(6)?;
+                let tokens_after: Option<i64> = row.get(7)?;
+                let compaction = method.map(|method| CompactionInfo {
+                    method,
+                    tokens_before: tokens_before.unwrap_or(0).max(0) as u64,
+                    tokens_after: tokens_after.unwrap_or(0).max(0) as u64,
+                });
+                Ok(StoredMessage {
+                    id: row.get(0)?,
+                    role: Role::parse(&role).unwrap_or(Role::User),
+                    content: row.get(2)?,
+                    reasoning: row.get(3)?,
+                    attachments: Vec::new(),
+                    compacted_from,
+                    compaction,
+                })
+            })?
+            .collect::<Result<_>>()?;
+        for message in &mut messages {
+            message.attachments = self.attachments_for(&message.id)?;
+        }
+        Ok(messages)
     }
 
     /// Returns the newest conversations. A limit of zero returns all of them.
@@ -387,5 +524,47 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         let newest = store.create_conversation("b", "mock").unwrap();
         assert_eq!(store.latest_conversation().unwrap(), Some(newest));
+    }
+
+    #[test]
+    fn attachments_survive_round_trip_on_thread() {
+        let store = Store::in_memory().unwrap();
+        let conversation = store.create_conversation("look at this", "mock").unwrap();
+        let attachments = vec![
+            Attachment::Url("https://example.com/a.png".into()),
+            Attachment::Inline { mime: "image/png".into(), base64: "AQID".into() },
+        ];
+        let message = NewMessage {
+            attachments: &attachments,
+            ..NewMessage::plain(None, Role::User, "look at this")
+        };
+        store.append(&conversation, message).unwrap();
+
+        let thread = store.thread(&conversation).unwrap();
+        assert_eq!(thread.len(), 1);
+        assert_eq!(thread[0].attachments, attachments);
+        assert_eq!(thread[0].to_message().attachments, attachments);
+    }
+
+    #[test]
+    fn inline_compaction_keeps_full_thread_and_resets_active_context() {
+        let store = Store::in_memory().unwrap();
+        let (conversation, _system, tip) = exchange(&store);
+        let info = CompactionInfo {
+            method: "handoff".into(),
+            tokens_before: 1200,
+            tokens_after: 180,
+        };
+        let summary = NewMessage::plain(Some(&tip), Role::User, "summary");
+        let summary_id = store.append_compaction(&conversation, summary, &tip, &info).unwrap();
+        store.append(&conversation, NewMessage::plain(Some(&summary_id), Role::User, "next")).unwrap();
+
+        let thread = store.thread(&conversation).unwrap();
+        let contents: Vec<_> = thread.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, ["Be brief", "question", "answer", "summary", "next"]);
+        assert_eq!(thread[3].compaction.as_ref(), Some(&info));
+
+        let active: Vec<_> = active_context(&thread).iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(active, ["summary", "next"]);
     }
 }

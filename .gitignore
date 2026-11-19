@@ -1,3 +1,5 @@
 /target
 /dist
 *.snap.new
+__pycache__/
+*.pyc

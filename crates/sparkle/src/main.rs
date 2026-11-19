@@ -235,6 +235,7 @@ fn load_attachments(args: &PromptArgs, stdin_bytes: Option<&[u8]>) -> Result<Vec
 fn save_exchange(
     context: &RunContext,
     prompt: &str,
+    attachments: &[Attachment],
     prefill: &str,
     outcome: &Outcome,
 ) -> Result<String> {
@@ -250,7 +251,11 @@ fn save_exchange(
             id
         }
     };
-    let user = store.append(&conversation, NewMessage::plain(parent.as_deref(), Role::User, prompt))?;
+    let user_message = NewMessage {
+        attachments,
+        ..NewMessage::plain(parent.as_deref(), Role::User, prompt)
+    };
+    let user = store.append(&conversation, user_message)?;
     let content = format!("{prefill}{}", outcome.text);
     store.append(
         &conversation,
@@ -259,6 +264,7 @@ fn save_exchange(
             role: Role::Assistant,
             content: &content,
             reasoning: (!outcome.reasoning.is_empty()).then_some(outcome.reasoning.as_str()),
+            attachments: &[],
             model: Some(&context.model.id),
             usage: outcome.usage,
             duration_ms: Some(outcome.duration_ms),
@@ -285,7 +291,7 @@ fn request_messages(context: &RunContext, user: Message, prefill: Option<&str>) 
     if let Some(system) = &context.system {
         messages.push(Message::new(Role::System, system.clone()));
     }
-    for message in context.history.iter().filter(|message| message.role != Role::System) {
+    for message in sparkle_store::active_context(&context.history) {
         push_message(&mut messages, message.to_message());
     }
     push_message(&mut messages, user);
@@ -320,7 +326,7 @@ async fn run_prompt(args: PromptArgs) -> Result<()> {
     };
 
     let mut user = Message::new(Role::User, prompt.clone());
-    user.attachments = attachments;
+    user.attachments = attachments.clone();
     let prefill = args.model.prefill.clone();
     let request = ChatRequest {
         model: context.model.wire_name.clone(),
@@ -343,8 +349,11 @@ async fn run_prompt(args: PromptArgs) -> Result<()> {
     let outcome = plain::stream_reply(context.provider.as_ref(), &request, render).await?;
     let response = format!("{prefix}{}", outcome.text);
 
-    let conversation =
-        if args.model.no_log { None } else { Some(save_exchange(&context, &prompt, prefix, &outcome)?) };
+    let conversation = if args.model.no_log {
+        None
+    } else {
+        Some(save_exchange(&context, &prompt, &attachments, prefix, &outcome)?)
+    };
 
     if args.json {
         let usage = outcome.usage.unwrap_or_default();
@@ -440,7 +449,9 @@ fn unsaved_message(role: Role, content: &str) -> StoredMessage {
         role,
         content: content.to_string(),
         reasoning: None,
+        attachments: Vec::new(),
         compacted_from: None,
+        compaction: None,
     }
 }
 
@@ -507,7 +518,7 @@ async fn run_plain_chat(mut context: RunContext, args: &ChatArgs) -> Result<()> 
                     context.history.push(unsaved_message(Role::User, &prompt));
                     context.history.push(unsaved_message(Role::Assistant, &reply));
                 } else {
-                    let id = save_exchange(&context, &prompt, &prefix, &outcome)?;
+                    let id = save_exchange(&context, &prompt, &[], &prefix, &outcome)?;
                     context.history = context.store.thread(&id)?;
                     context.conversation_id = Some(id);
                 }

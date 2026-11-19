@@ -1,6 +1,7 @@
 //! Drawing. Everything here reads application state and writes to a frame.
 
 use sparkle_core::Role;
+use sparkle_core::compact;
 use sparkle_core::context::{
     self, Fit, compact_count, estimate_tokens, format_bytes, size_label, usage_label,
 };
@@ -67,10 +68,55 @@ fn attached_label(count: usize) -> String {
     format!("{count} file{} attached", if count == 1 { "" } else { "s" })
 }
 
+fn compaction_divider(
+    turn: &Turn,
+    columns: usize,
+    expanded: bool,
+    theme: &Theme,
+    icons: &Icons,
+) -> Line<'static> {
+    let method = turn.compaction.as_ref().map(|info| info.method.as_str());
+    let mut label = format!(
+        "{} {}",
+        if expanded { icons.expanded } else { icons.collapsed },
+        compact::divider_label_for(method),
+    );
+    if let Some(info) = &turn.compaction
+        && info.tokens_before > 0
+    {
+        label.push_str(&format!(
+            " · ~{} → ~{}",
+            compact_count(info.tokens_before),
+            compact_count(info.tokens_after),
+        ));
+    }
+    let hint = "· ctrl+o";
+    let plain_width = label.width() + 1 + hint.width();
+    let rule = if icons.assistant == "*" { "-" } else { "─" };
+    let faint = Style::new().fg(theme.faint);
+    let muted = Style::new().fg(theme.muted);
+    if columns >= plain_width + 6 {
+        let remaining = columns - plain_width - 2;
+        let left = remaining / 2;
+        let right = remaining - left;
+        Line::from(vec![
+            Span::styled(rule.repeat(left), faint),
+            Span::raw(" "),
+            Span::styled(label, muted),
+            Span::raw(" "),
+            Span::styled(hint, faint),
+            Span::raw(" "),
+            Span::styled(rule.repeat(right), faint),
+        ])
+    } else {
+        Line::from(Span::styled(label, muted))
+    }
+}
+
 fn render_turn(
     turn: &Turn,
     width: u16,
-    show_reasoning: bool,
+    show_detail: bool,
     theme: &Theme,
     icons: &Icons,
 ) -> Vec<Line<'static>> {
@@ -82,11 +128,16 @@ fn render_turn(
             prefixed(&mut lines, &turn.text, columns, bar, Style::new().fg(theme.muted));
         }
         Some(_) if turn.summary => {
-            lines.push(Line::from(Span::styled(
-                "Summary of earlier conversation",
-                Style::new().fg(theme.heading).add_modifier(Modifier::BOLD),
-            )));
-            lines.extend(markdown::render(&turn.text, width, theme, icons));
+            lines.push(compaction_divider(turn, columns, show_detail, theme, icons));
+            if show_detail {
+                let inner_width = width.saturating_sub(2).max(8);
+                let bar = Span::styled("│ ", Style::new().fg(theme.faint));
+                for line in markdown::render(&turn.text, inner_width, theme, icons) {
+                    let mut spans = vec![bar.clone()];
+                    spans.extend(line.spans);
+                    lines.push(Line::from(spans));
+                }
+            }
         }
         Some(Role::User | Role::System) => {
             let bar = Span::styled("▍ ", Style::new().fg(theme.user));
@@ -108,7 +159,7 @@ fn render_turn(
             lines.push(Line::from(header));
 
             if !turn.reasoning.is_empty() {
-                let chevron = if show_reasoning { icons.expanded } else { icons.collapsed };
+                let chevron = if show_detail { icons.expanded } else { icons.collapsed };
                 let label = turn.thought_ms.map_or_else(
                     || "Thinking".to_string(),
                     |thought| format!("Thought for {}", seconds(thought)),
@@ -117,7 +168,7 @@ fn render_turn(
                     format!("{chevron} {} {label}", icons.thinking),
                     Style::new().fg(theme.muted),
                 )));
-                if show_reasoning {
+                if show_detail {
                     let bar = Span::styled("│ ", Style::new().fg(theme.faint));
                     let style = Style::new().fg(theme.muted).add_modifier(Modifier::ITALIC);
                     prefixed(&mut lines, turn.reasoning.trim_end(), columns, bar, style);
@@ -208,9 +259,11 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
     let width = area.width.saturating_sub(2).clamp(10, MAX_CONTENT_WIDTH);
-    let (theme, icons, show) = (app.theme, app.icons, app.show_reasoning);
+    let (theme, icons, show_reasoning, show_summary) =
+        (app.theme, app.icons, app.show_reasoning, app.show_compaction_summary);
     let mut lines: Vec<Line<'static>> = Vec::new();
     for turn in &mut app.turns {
+        let show = if turn.summary { show_summary } else { show_reasoning };
         let fresh = turn
             .cache
             .as_ref()
@@ -1013,7 +1066,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_compacted_chat_shows_the_summary_and_what_was_saved() {
+    async fn a_compacted_chat_shows_the_divider_and_expands_on_ctrl_o() {
         let (mut app, mut receiver, provider) = chat_ready_to_compact().await;
         app.context_window = Some(1000);
         let before = text(&status_line(&app, 100));
@@ -1023,11 +1076,15 @@ mod tests {
         drain(&mut app, &mut receiver).await;
 
         let shown = screen(&mut app, 80, 24);
-        assert!(shown.contains("Summary of earlier conversation"), "{shown}");
-        assert!(shown.contains("The short version"), "{shown}");
-        assert!(shown.contains("Compacted 2 messages (~141 -> ~24 tokens)"), "{shown}");
-        assert!(!shown.contains("a long answer"), "{shown}");
+        assert!(shown.contains("compacted (summary) · ~141 → ~24 · ctrl+o"), "{shown}");
+        assert!(shown.contains("a long answer"), "prior messages stay visible above divider: {shown}");
+        assert!(!shown.contains("The short version"), "summary is collapsed until ctrl+o: {shown}");
         assert!(!shown.contains("[Summary of the earlier"), "the header is for the model: {shown}");
+
+        // Pressing ctrl+o expands the summary markdown below the divider.
+        app.on_terminal(Event::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)));
+        let expanded = screen(&mut app, 80, 24);
+        assert!(expanded.contains("The short version"), "{expanded}");
 
         let after = text(&status_line(&app, 100));
         assert_ne!(before, after);

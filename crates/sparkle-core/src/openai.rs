@@ -38,15 +38,16 @@ impl OpenAiCompat {
         reqwest::Url::parse(&self.base_url).ok()?.host_str().map(str::to_string)
     }
 
-    fn is_openai(&self) -> bool {
-        self.host().is_some_and(|host| host == "openai.com" || host.ends_with(".openai.com"))
+    fn is_local(&self) -> bool {
+        self.host().is_some_and(|host| is_local_host(&host))
     }
 
-    /// The body to send. Streams elsewhere ask for prefill progress, which llama-server reports.
+    /// The body to send. Streams to local servers ask for prefill progress, which llama-server
+    /// reports. Strict hosted OpenAI-compatible endpoints can reject unknown top-level fields.
     fn wire_body(&self, request: &ChatRequest) -> Value {
         let mut body = request_body(request);
         if request.stream
-            && !self.is_openai()
+            && self.is_local()
             && let Some(map) = body.as_object_mut()
         {
             // An explicit `-o return_progress false` turns this off.
@@ -61,7 +62,7 @@ impl OpenAiCompat {
     }
 
     async fn fetch_context_window(&self) -> Option<u64> {
-        if !self.host().is_some_and(|host| is_local_host(&host)) {
+        if !self.is_local() {
             return None;
         }
         let mut builder = self.client.get(self.props_url()).timeout(PROPS_TIMEOUT);
@@ -488,28 +489,39 @@ mod tests {
     }
 
     #[test]
-    fn only_streams_to_other_servers_ask_for_progress() {
-        let local = OpenAiCompat::new("http://127.0.0.1:8080/v1", None);
-        assert_eq!(local.wire_body(&request())["return_progress"], true);
+    fn only_streams_to_local_servers_ask_for_progress() {
+        for url in ["http://127.0.0.1:8080/v1", "http://localhost:8080/v1", "http://192.168.1.20:8080/v1"] {
+            let local = OpenAiCompat::new(url, None);
+            assert_eq!(local.wire_body(&request())["return_progress"], true, "{url}");
+        }
 
+        let local = OpenAiCompat::new("http://127.0.0.1:8080/v1", None);
         let mut whole = request();
         whole.stream = false;
         assert!(local.wire_body(&whole).get("return_progress").is_none());
 
-        for url in ["https://api.openai.com/v1", "https://API.OpenAI.com/v1/"] {
-            let openai = OpenAiCompat::new(url, None);
-            assert!(openai.wire_body(&request()).get("return_progress").is_none(), "{url}");
+        for url in [
+            "https://api.openai.com/v1",
+            "https://API.OpenAI.com/v1/",
+            "https://openrouter.ai/api/v1",
+            "https://api.groq.com/openai/v1",
+        ] {
+            let remote = OpenAiCompat::new(url, None);
+            assert!(remote.wire_body(&request()).get("return_progress").is_none(), "{url}");
         }
-        let lookalike = OpenAiCompat::new("https://api.openai.com.example.org/v1", None);
-        assert_eq!(lookalike.wire_body(&request())["return_progress"], true);
     }
 
     #[test]
-    fn an_explicit_option_can_turn_progress_off() {
-        let mut request = request();
-        request.options.extra.insert("return_progress".into(), json!(false));
+    fn an_explicit_option_can_toggle_progress() {
+        let mut off = request();
+        off.options.extra.insert("return_progress".into(), json!(false));
         let local = OpenAiCompat::new("http://localhost:8080/v1", None);
-        assert_eq!(local.wire_body(&request)["return_progress"], false);
+        assert_eq!(local.wire_body(&off)["return_progress"], false);
+
+        let mut on = request();
+        on.options.extra.insert("return_progress".into(), json!(true));
+        let remote = OpenAiCompat::new("https://openrouter.ai/api/v1", None);
+        assert_eq!(remote.wire_body(&on)["return_progress"], true);
     }
 
     #[test]

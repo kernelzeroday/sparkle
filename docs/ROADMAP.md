@@ -18,15 +18,19 @@ feature map and milestones.
 
 ## Context compaction
 
-- **`/compact [FOCUS]`** (done) summarizes every turn up to the last finished reply with the
-  current model and continues the chat from that summary. The system prompt is left alone, and
-  anything after the last finished reply, such as a message that failed to send, is kept word for
-  word. Stopping the request, a server error, or a summary that is empty, cut off or no shorter
-  leaves the conversation unchanged.
-- **History stays intact** (done). In keeping with "never lose the user's words", the summary
-  starts a new branch in the message tree and records the tip of the branch it replaced in
-  `messages.compacted_from`. Stored messages are never rewritten or deleted, and `--cid` and `-c`
-  resume from the summary.
+- **`/compact [summary|handoff|shake|trim] [FOCUS]`** (done) compacts active turns up to the last
+  finished reply and inserts an inline divider (`── ▸ compacted (<method>) · ~before → ~after · ctrl+o ──`)
+  into the transcript. Earlier messages stay visible above the divider (including across resume),
+  while the model receives only the system prompt, the latest compaction summary, and turns after
+  it. Press `ctrl+o` to expand or collapse the summary. Supported methods:
+  - `summary` (default): concise LLM summary, optionally guided by `[FOCUS]`.
+  - `handoff`: structured LLM handoff document (Goal, Constraints, Progress, Decisions, Context).
+  - `shake`: local, zero-LLM elision of large fenced code blocks and verbose older passages.
+  - `trim [N]`: local, zero-LLM sliding window that drops older messages and keeps the last `N`.
+- **History stays intact** (done). Compaction entries are appended inline on the active branch with
+  their method and before/after token estimates recorded in SQLite. Stored messages are never
+  rewritten or deleted, and `--cid` and `-c` resume with the full display transcript while sending
+  only the active compacted context to the model.
 - **Automatic compaction** (planned) will offer the same step as a conversation nears the context
   limit. It depends on a trustworthy context size, so it stays off wherever that size is unknown.
 

@@ -666,3 +666,19 @@ fn plain_chat_ends_at_end_of_input_and_ignores_blank_lines() {
     assert!(output.status.success());
     assert_eq!(harness.chat_requests().len(), 1);
 }
+
+#[test]
+fn continuing_a_conversation_preserves_earlier_attachments() {
+    let harness = Harness::new();
+    let image = harness.write_file("photo.png", "fake-png-bytes");
+    assert!(harness.run(&["-R", "-a", &image, "What is this?"]).status.success());
+    assert!(harness.run(&["-R", "-c", "Look closer"]).status.success());
+
+    let messages = harness.last_body()["messages"].as_array().unwrap().clone();
+    assert_eq!(messages.len(), 3);
+    let first_content = messages[0]["content"].as_array().unwrap();
+    assert_eq!(first_content[0]["text"], "What is this?");
+    assert_eq!(first_content[1]["type"], "image_url");
+    assert!(first_content[1]["image_url"]["url"].as_str().unwrap().starts_with("data:image/png;base64,"));
+    assert_eq!(messages[2]["content"], "Look closer");
+}

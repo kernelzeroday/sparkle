@@ -45,6 +45,7 @@ Replies go to stdout. Reasoning and animation go to stderr, so pipes receive onl
 | `esc` | Stop the reply |
 | `tab` | Complete a `/command`, press again to cycle |
 | `ctrl+t` | Show or hide thinking |
+| `ctrl+o` | Show or hide compaction summaries |
 | `shift+tab` | Cycle reasoning effort |
 | `pgup`, `pgdn` | Scroll |
 | `ctrl+c` | Stop the reply, or clear the input |
@@ -53,8 +54,11 @@ Replies go to stdout. Reasoning and animation go to stderr, so pipes receive onl
 Commands: `/help`, `/new`, `/model`, `/effort`, `/persona`, `/prompts`, `/system`, `/prefill`,
 `/retry`, `/edit`, `/compact`, `/quit`.
 
-`/compact [FOCUS]` replaces the conversation so far with a summary to free context, optionally
-telling the model what to focus on. The original messages stay in the history database.
+`/compact [summary|handoff|shake|trim] [FOCUS]` inserts an inline compaction divider to free
+context while keeping earlier messages visible in the scrollback (press `ctrl+o` to expand or
+collapse the summary). `summary` (default) and `handoff` ask the model to condense earlier turns;
+`shake` elides large code blocks locally without a model call; `trim [N]` drops older turns locally
+and keeps the latest `N` messages.
 
 ## System prompts
 

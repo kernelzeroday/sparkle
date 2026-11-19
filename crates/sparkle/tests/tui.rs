@@ -540,10 +540,11 @@ fn compact_replaces_the_conversation_with_a_summary() {
     assert_eq!(request[1], "first question");
     assert!(request.last().unwrap().ends_with("focus on: keep the names"), "{request:?}");
 
-    tui.wait_for("Compacted 4 messages (~");
-    tui.wait_for("Summary of earlier conversation");
+    tui.wait_for("compacted (summary)");
+    tui.wait_for("Compacted 4 messages via summary");
+    // Prior messages stay visible in the scrollback above the divider, and ctrl+o expands summary.
+    tui.send("\x0f");
     tui.wait_for(MOCK_SUMMARY);
-    tui.wait_gone("first question");
 
     tui.ask(&harness, "third question");
     let sent = contents(&harness.last_body());
@@ -609,7 +610,8 @@ fn a_compacted_chat_resumes_from_its_summary_in_every_front_end() {
     let id = logs[0]["id"].as_str().unwrap().to_string();
 
     let mut resumed = Tui::open(&harness, &["chat", "--cid", &id]);
-    resumed.wait_for("Summary of earlier conversation");
+    resumed.wait_for("compacted (summary)");
+    resumed.send("\x0f");
     resumed.wait_for(MOCK_SUMMARY);
     assert!(!resumed.screen().contains(SUMMARY_MESSAGE_START), "{}", resumed.screen());
     resumed.ask(&harness, "third question");
