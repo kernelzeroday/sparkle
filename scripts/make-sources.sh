@@ -52,7 +52,9 @@ import re, sys
 tree, licenses_out, bundled_out = sys.argv[1:]
 licenses, bundled = set(), set()
 for line in open(tree):
-    package, _, license = line.rstrip("\n").partition("|")
+    # cargo tree marks a crate it already listed with a trailing "(*)".
+    line = line.rstrip("\n").removesuffix(" (*)")
+    package, _, license = line.partition("|")
     name, version = package.split()[:2]
     license = re.sub(r"\s*/\s*", " OR ", license.strip()) or "LicenseRef-unknown"
     if license == "LicenseRef-unknown":
