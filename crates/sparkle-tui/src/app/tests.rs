@@ -1586,3 +1586,48 @@ async fn the_wheel_moves_through_the_prompt_browser_when_it_is_open() {
     assert_ne!(first, second);
     assert_eq!(app.scroll, 0, "the conversation behind the browser stays put");
 }
+
+#[test]
+fn the_context_reading_starts_at_half_full_in_steps_of_a_tenth() {
+    assert_eq!(meter_line(499, 1000), None);
+    assert_eq!(
+        meter_line(500, 1000).as_deref(),
+        Some("[sparkle: about 50% of your 1k-token context window is in use]")
+    );
+    assert!(meter_line(739, 1000).unwrap().contains("about 70%"));
+    assert!(meter_line(5000, 1000).unwrap().contains("about 100%"));
+}
+
+#[tokio::test]
+async fn the_model_is_told_how_full_her_context_is_without_it_reaching_history() {
+    let store = Store::in_memory().unwrap();
+    let (mut app, mut receiver, provider) = app_with(reply_events(), Some(store));
+    app.sparkle_context = true;
+    app.context_window = Some(1000);
+    // Small enough to stay under half the window at first.
+    say(&mut app, &mut receiver, "hello").await;
+    let first = provider.requests.lock().unwrap()[0].messages.clone();
+    assert_eq!(first.last().unwrap().content, "hello", "nothing below half full");
+
+    let long = "word ".repeat(500);
+    say(&mut app, &mut receiver, &long).await;
+    let requests = provider.requests.lock().unwrap();
+    let sent = &requests[1].messages;
+    let last = &sent.last().unwrap().content;
+    assert!(last.starts_with(long.trim_end()) && last.contains("\n\n[sparkle: about "), "{last}");
+    // The earlier message is sent exactly as before, so the cached prefix still matches.
+    assert_eq!(sent[..first.len()], first[..]);
+    // The person's transcript and saved history never see the reading.
+    assert_eq!(app.turns[2].text, long.trim_end());
+    let thread = app.store.as_ref().unwrap().thread(app.conversation_id.as_ref().unwrap()).unwrap();
+    assert!(thread.iter().all(|message| !message.content.contains("[sparkle:")));
+}
+
+#[tokio::test]
+async fn there_is_no_context_reading_without_the_note_that_explains_it() {
+    let (mut app, mut receiver, provider) = app_with(reply_events(), None);
+    app.context_window = Some(1000);
+    say(&mut app, &mut receiver, &"word ".repeat(500)).await;
+    let requests = provider.requests.lock().unwrap();
+    assert!(!requests[0].messages.last().unwrap().content.contains("[sparkle:"));
+}

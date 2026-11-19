@@ -19,7 +19,11 @@ pub fn note(today: &str, journal: bool) -> String {
          particular product or app, such as its web search, file creation, artifacts, connectors, \
          image or video generation, or memory of past chats, those features are not available \
          here, and there are no tools to call. Answer from what you know. The person reads your replies as \
-         Markdown in their terminal and can stop, retry, or edit them. {memory}"
+         Markdown in their terminal and can stop, retry, or edit them. Once the conversation \
+         fills half of your context window, the person's messages end with a short line such as \
+         [sparkle: about 70% of your context window is in use]; it comes from the app, not from \
+         them. When it runs high, the person can free space by typing /compact, which you can \
+         suggest. {memory}"
     )
 }
 
@@ -41,5 +45,7 @@ mod tests {
         let without = note("2026-11-19", false);
         assert!(!without.contains("journal"));
         assert!(without.ends_with("Nothing carries over from one conversation to the next."));
+        assert!(with.contains("[sparkle: about 70% of your context window is in use]"));
+        assert!(with.contains("/compact"));
     }
 }

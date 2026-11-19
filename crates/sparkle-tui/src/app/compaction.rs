@@ -189,7 +189,7 @@ impl App {
         else {
             return Ok(None);
         };
-        let content = summary.wire_text();
+        let content = summary.stored_text();
         let message = NewMessage {
             model: Some(&summary.model),
             usage: summary.usage,
@@ -200,7 +200,7 @@ impl App {
         let mut parent = summary_id.clone();
         for turn in self.turns[replaced..].iter().filter(|turn| turn.is_sent()) {
             let role = turn.role.expect("sent turns have a role");
-            let wire = turn.wire_text();
+            let wire = turn.stored_text();
             let copy = NewMessage {
                 parent_id: Some(parent.as_str()),
                 role,

@@ -129,6 +129,9 @@ pub struct Turn {
     pub compaction: Option<CompactionInfo>,
     /// What this reply did to the journal.
     pub journaled: journal::Applied,
+    /// How full the context window was when this message was sent, for the model. Fixed then,
+    /// so that the start of every later request stays the same and prompt caches stay valid.
+    pub meter: Option<String>,
     pub cache: Option<(u16, bool, Vec<Line<'static>>)>,
 }
 
@@ -165,8 +168,8 @@ impl Turn {
             && !self.interrupted
     }
 
-    /// The full message content the model receives.
-    fn wire_text(&self) -> String {
+    /// The message as history keeps it: attached files, then the text.
+    fn stored_text(&self) -> String {
         if self.context.is_empty() {
             self.text.clone()
         } else {
@@ -174,12 +177,22 @@ impl Turn {
         }
     }
 
+    /// The full message content the model receives: the stored text, then the context reading
+    /// taken when it was sent. The reading is not kept in history or shown in the transcript.
+    fn wire_text(&self) -> String {
+        match &self.meter {
+            Some(meter) => format!("{}\n\n{meter}", self.stored_text()),
+            None => self.stored_text(),
+        }
+    }
+
     /// The size of `wire_text` in bytes.
     fn wire_len(&self) -> usize {
-        match self.context.len() {
+        let stored = match self.context.len() {
             0 => self.text.len(),
             context => context + 1 + self.text.len(),
-        }
+        };
+        stored + self.meter.as_ref().map_or(0, |meter| meter.len() + 2)
     }
 }
 
@@ -240,6 +253,18 @@ pub struct Completion {
     pub typed: String,
     pub index: usize,
     pub current: String,
+}
+
+/// The reading the model is given, or `None` below half full. Rounded down to a tenth so it
+/// changes only every few messages.
+pub fn meter_line(used: u64, window: u64) -> Option<String> {
+    let percent = used.saturating_mul(100) / window.max(1);
+    if percent < 50 {
+        return None;
+    }
+    let step = (percent / 10 * 10).min(100);
+    let size = sparkle_core::context::compact_count(window);
+    Some(format!("[sparkle: about {step}% of your {size}-token context window is in use]"))
 }
 
 /// Commands whose names start with `typed`.
@@ -830,7 +855,24 @@ impl App {
         turn.parent_id = self.tip_id();
         self.persist_user(&mut turn);
         self.turns.push(turn);
+        self.read_meter();
         self.begin_reply();
+    }
+
+    /// Tells the model how full her context window is, once that is worth knowing: from half
+    /// full, in steps of a tenth, so the reading changes rarely and never nags. It goes on the
+    /// message just sent, the one place a changing line does not disturb the cached prefix.
+    fn read_meter(&mut self) {
+        // The note about sparkle is what explains the reading, so they come and go together.
+        if !self.sparkle_context {
+            return;
+        }
+        let Some(window) = self.context_window.filter(|window| *window > 0) else { return };
+        let (used, _) = self.context_used();
+        let Some(meter) = meter_line(used, window) else { return };
+        if let Some(turn) = self.turns.last_mut() {
+            turn.meter = Some(meter);
+        }
     }
 
     /// The text for the terminal's title bar.
@@ -919,7 +961,7 @@ impl App {
                     id
                 }
             };
-            let content = turn.wire_text();
+            let content = turn.stored_text();
             let message = NewMessage::plain(turn.parent_id.as_deref(), Role::User, &content);
             store.append(&conversation, message)
         })();
