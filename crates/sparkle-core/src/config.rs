@@ -108,6 +108,9 @@ pub struct Settings {
     /// Tell the chat model she is in sparkle, so a prompt written for another product does not
     /// lead her to offer its features. Defaults to true.
     pub sparkle_context: Option<bool>,
+    /// Let the mouse wheel scroll the conversation. Defaults to true; with it on, hold shift to
+    /// select text in most terminals.
+    pub mouse: Option<bool>,
     pub models: Vec<ModelConfig>,
 }
 

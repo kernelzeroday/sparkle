@@ -67,11 +67,20 @@ impl InputThread {
     }
 }
 
-fn enter_terminal() -> io::Result<(DefaultTerminal, bool)> {
+/// Asks for mouse button and wheel reports in SGR form, without movement reports. Without it,
+/// most terminals turn the wheel into arrow keys on this screen, which the input box reads as
+/// history recall. Shift+drag still selects text in most terminals.
+const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h";
+const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1000l";
+
+fn enter_terminal(mouse: bool) -> io::Result<(DefaultTerminal, bool)> {
     let terminal = ratatui::try_init()?;
     let enhanced = supports_keyboard_enhancement().unwrap_or(false);
     // Saves the current window title so it can be put back on exit.
     stdout().write_all(b"\x1b[22;2t")?;
+    if mouse {
+        stdout().write_all(MOUSE_ON)?;
+    }
     execute!(stdout(), EnableBracketedPaste)?;
     if enhanced {
         // Lets the terminal report shift+enter separately from enter.
@@ -83,9 +92,12 @@ fn enter_terminal() -> io::Result<(DefaultTerminal, bool)> {
     Ok((terminal, enhanced))
 }
 
-fn leave_terminal(enhanced: bool) {
+fn leave_terminal(enhanced: bool, mouse: bool) {
     if enhanced {
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+    }
+    if mouse {
+        let _ = stdout().write_all(MOUSE_OFF);
     }
     let _ = execute!(stdout(), DisableBracketedPaste);
     let _ = stdout().write_all(b"\x1b[23;2t");
@@ -124,9 +136,10 @@ fn edit_in_editor(text: &str) -> io::Result<String> {
 
 /// Runs the chat until the user quits. Returns the conversation id, if one was saved.
 pub async fn run(session: ChatSession) -> io::Result<Option<String>> {
+    let mouse = session.mouse;
     let (mut app, mut receiver) = App::new(session);
     app.request_context_window();
-    let (mut terminal, enhanced) = enter_terminal()?;
+    let (mut terminal, enhanced) = enter_terminal(mouse)?;
     let mut input = InputThread::start();
     let mut ticker = tokio::time::interval(FRAME);
 
@@ -167,10 +180,10 @@ pub async fn run(session: ChatSession) -> io::Result<Option<String>> {
         if app.action.take() == Some(Action::EditLastReply) {
             // The reader must stop first or it competes with the editor for keystrokes.
             input.stop();
-            leave_terminal(enhanced);
+            leave_terminal(enhanced, mouse);
             let text = app.last_reply_text().unwrap_or_default().to_string();
             let edited = edit_in_editor(&text);
-            match enter_terminal() {
+            match enter_terminal(mouse) {
                 Ok((restored, _)) => terminal = restored,
                 Err(error) => return Err(error),
             }
@@ -189,6 +202,6 @@ pub async fn run(session: ChatSession) -> io::Result<Option<String>> {
 
     input.stop();
     app.cancel();
-    leave_terminal(enhanced);
+    leave_terminal(enhanced, mouse);
     outcome.map(|()| app.conversation_id.clone())
 }

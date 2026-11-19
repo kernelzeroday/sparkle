@@ -91,6 +91,7 @@ fn session_with(
         show_thinking_file: None,
         journal: None,
         sparkle_context: false,
+        mouse: false,
         default_prompt_file: None,
     }
 }
@@ -1539,4 +1540,49 @@ async fn the_note_about_sparkle_can_be_turned_off() {
     say(&mut app, &mut receiver, "hi").await;
     assert_eq!(provider.requests.lock().unwrap()[0].messages[0].content, "Be kind");
     assert_eq!(app.wire_system().as_deref(), Some("Be kind"));
+}
+
+fn wheel(app: &mut App, kind: crossterm::event::MouseEventKind) {
+    app.on_terminal(Event::Mouse(crossterm::event::MouseEvent {
+        kind,
+        column: 10,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    }));
+}
+
+#[tokio::test]
+async fn the_wheel_scrolls_the_conversation_and_leaves_the_input_alone() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, mut receiver, _provider) = app_with(reply_events(), None);
+    say(&mut app, &mut receiver, "first").await;
+    type_text(&mut app, "draft");
+
+    wheel(&mut app, MouseEventKind::ScrollUp);
+    wheel(&mut app, MouseEventKind::ScrollUp);
+    assert_eq!(app.scroll, 6);
+    assert_eq!(app.input.lines().join(""), "draft", "the wheel never recalls history");
+    wheel(&mut app, MouseEventKind::ScrollDown);
+    assert_eq!(app.scroll, 3);
+
+    // The arrows still recall sent messages.
+    press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+    assert_eq!(app.input.lines().join(""), "first");
+
+    // Clicks do nothing and do not even ask for a redraw.
+    app.dirty = false;
+    wheel(&mut app, MouseEventKind::Down(MouseButton::Left));
+    assert!(!app.dirty);
+}
+
+#[tokio::test]
+async fn the_wheel_moves_through_the_prompt_browser_when_it_is_open() {
+    use crossterm::event::MouseEventKind;
+    let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+    app.prompts_command("");
+    let first = app.picker.as_ref().unwrap().selected().unwrap().name.clone();
+    wheel(&mut app, MouseEventKind::ScrollDown);
+    let second = app.picker.as_ref().unwrap().selected().unwrap().name.clone();
+    assert_ne!(first, second);
+    assert_eq!(app.scroll, 0, "the conversation behind the browser stays put");
 }

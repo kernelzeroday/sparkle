@@ -48,7 +48,8 @@ Replies go to stdout. Reasoning and animation go to stderr, so pipes receive onl
 | `ctrl+o` | Show or hide compaction summaries |
 | `shift+tab` | Cycle reasoning effort |
 | `up`, `down` | Recall sent messages; `up` on an empty input takes back a queued one |
-| `pgup`, `pgdn`, `shift+up`, `shift+down` | Scroll |
+| mouse wheel, `pgup`, `pgdn`, `shift+up`, `shift+down` | Scroll the conversation |
+| `shift` + drag | Select text (sparkle takes the wheel, so plain dragging may not select) |
 | `ctrl+c` | Stop the reply, or clear the input |
 | `ctrl+c` or `ctrl+d` twice | Exit, when the input is empty |
 
@@ -157,6 +158,7 @@ context_warn_percent = 80 # warn when a request fills this much of the context w
 retries = 5          # resend a failed request this many times, backing off 1s, 2s, 4s…
 journal = true       # let the chat model keep a journal about you (see above)
 sparkle_context = true # tell the chat model she is in sparkle (see System prompts)
+mouse = true         # the wheel scrolls the conversation; false gives the terminal its mouse
 
 [[models]]
 id = "local"

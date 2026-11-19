@@ -223,6 +223,40 @@ fn by_default_the_chat_tells_the_model_where_she_is() {
     assert_eq!(harness.last_body()["messages"][0]["content"], "You are Claude.");
 }
 
+#[test]
+fn the_mouse_wheel_scrolls_and_the_arrows_recall_messages() {
+    let harness = Harness::new();
+    let mut tui = Tui::open(&harness, &[]);
+    assert!(tui.raw().contains("\x1b[?1000h\x1b[?1006h"), "wheel reports are requested");
+    tui.ask(&harness, "first question");
+    tui.wait_for("Hello world");
+    let sent = harness.chat_requests().len();
+
+    // A wheel step up (SGR button 64), then enter: the input stays empty, so nothing is sent.
+    tui.send("\x1b[<64;10;5M");
+    tui.send("\r");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(harness.chat_requests().len(), sent, "the wheel did not recall a message");
+
+    // The up arrow does recall it.
+    tui.send("\x1b[A");
+    tui.send("\r");
+    harness.wait_for_requests(sent + 1);
+    assert_eq!(contents(&harness.last_body()).last().unwrap(), "first question");
+    tui.quit();
+    assert!(tui.raw().contains("\x1b[?1006l\x1b[?1000l"), "the terminal is given its mouse back");
+}
+
+#[test]
+fn mouse_reports_can_be_turned_off() {
+    let harness = Harness::new();
+    harness.write_file("config.toml", "mouse = false\n");
+    let mut tui = Tui::open(&harness, &[]);
+    tui.wait_for("Chatting with mock");
+    assert!(!tui.raw().contains("\x1b[?1000h"));
+    tui.quit();
+}
+
 // Leaving the chat
 
 #[test]

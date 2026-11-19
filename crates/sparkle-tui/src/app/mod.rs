@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use futures_util::StreamExt;
 use sparkle_core::compact;
 use sparkle_core::context::{self, Fit, estimate_tokens};
@@ -49,6 +49,9 @@ pub const COMMANDS: &[(&str, &str)] = &[
 ];
 
 const EFFORTS: [Option<&str>; 4] = [None, Some("low"), Some("medium"), Some("high")];
+
+/// Lines one wheel step scrolls the conversation.
+const WHEEL_LINES: usize = 3;
 
 /// How long the second ctrl+c or ctrl+d has to arrive.
 const EXIT_WINDOW: Duration = Duration::from_secs(2);
@@ -97,6 +100,8 @@ pub struct ChatSession {
     pub journal: Option<Journal>,
     /// Tell the model she is in sparkle, ahead of any chosen system prompt.
     pub sparkle_context: bool,
+    /// Take mouse wheel events, so the wheel scrolls the conversation.
+    pub mouse: bool,
     /// Where the default system prompt is saved. Without one, defaults cannot be changed.
     pub default_prompt_file: Option<PathBuf>,
 }
@@ -531,10 +536,29 @@ impl App {
                     self.input.insert_str(text);
                 }
             },
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp => self.on_wheel(-1),
+                MouseEventKind::ScrollDown => self.on_wheel(1),
+                // Clicks and drags mean nothing here; skip the redraw.
+                _ => return,
+            },
             Event::Resize(..) => {}
             _ => return,
         }
         self.dirty = true;
+    }
+
+    /// The wheel scrolls whatever is being read: the prompt browser's list when it is open,
+    /// otherwise the conversation. It never touches the input or its history.
+    fn on_wheel(&mut self, direction: isize) {
+        if let Some(picker) = &mut self.picker {
+            picker.move_by(direction);
+            return;
+        }
+        self.scroll = match direction {
+            up if up < 0 => self.scroll.saturating_add(WHEEL_LINES),
+            _ => self.scroll.saturating_sub(WHEEL_LINES),
+        };
     }
 
     fn input_is_empty(&self) -> bool {
