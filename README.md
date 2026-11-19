@@ -67,14 +67,15 @@ and keeps the latest `N` messages.
 In the chat, the model keeps a journal: short notes about you that she chooses to carry from one
 conversation to the next. Writing is up to her and costs nothing extra. She writes a tag anywhere
 in a reply, `<journal keep="3w">…</journal>`, which is saved and hidden from the transcript; a
-faint `✎ noted` marks the reply. She decides how long each note lasts (`5d`, `3w`, `6m`, `1y` or
+faint `✎ noted` marks the reply. A note can be a line or a few sentences, and an optional
+`about="topic"` files related notes under a heading, so a project's decisions stay together. She decides how long each note lasts (`5d`, `3w`, `6m`, `1y` or
 `always`, 30 days by default), notes fade when their time is up, and she lets one go early by
 quoting a few of its words, `<journal forget="back soon"/>`. A quote removes a note only when it
 matches exactly one, and the reply is marked `✎ let go`.
 
 The notes still in force reach her once, with the system prompt, when a conversation opens, framed
 as background she need not mention or tend to. They are not refreshed mid-conversation, which keeps
-server prompt caches valid, and they are capped at about 750 tokens. `/journal` shows the notes,
+server prompt caches valid, and they are capped at about 2,000 tokens, newest first. `/journal` shows the notes,
 `/journal clear` empties it, and `journal = false` in the config turns it off. One-shot prompts and
 `--plain` chats never see it.
 

@@ -1410,7 +1410,7 @@ async fn the_journal_stays_put_during_a_conversation_and_refreshes_on_new() {
 async fn the_model_can_let_a_note_go_by_quoting_it() {
     let (mut app, mut receiver, provider) = app_with(Vec::new(), None);
     let journal = with_journal(&mut app, "forget");
-    let keep = |text: &str| journal::Action::Keep { text: text.into(), keep: None };
+    let keep = |text: &str| journal::Action::Keep { text: text.into(), keep: None, about: None };
     journal.apply(&[keep("Their name is Kelsey"), keep("Back soon to test the journal")], None).unwrap();
     app.reopen_journal();
     // A guessed number does nothing; quoting the note lets it go and marks the reply.
@@ -1442,7 +1442,7 @@ async fn the_person_can_read_and_clear_the_journal() {
     let journal = with_journal(&mut app, "read");
     say(&mut app, &mut receiver, "/journal").await;
     assert_eq!(app.turns.last().unwrap().text, "The journal is empty");
-    let keep = journal::Action::Keep { text: "Likes tea".into(), keep: Some(86_400 * 7) };
+    let keep = journal::Action::Keep { text: "Likes tea".into(), keep: Some(86_400 * 7), about: None };
     journal.apply(&[keep], None).unwrap();
     say(&mut app, &mut receiver, "/journal").await;
     let listing = &app.turns.last().unwrap().text;

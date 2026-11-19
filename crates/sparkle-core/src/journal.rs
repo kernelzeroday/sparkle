@@ -20,12 +20,16 @@ use serde::{Deserialize, Serialize};
 
 const TAG: &str = "<journal";
 const CLOSE: &str = "</journal>";
-/// A note longer than this is cut, so that a single note cannot crowd out the rest.
-const MAX_NOTE_CHARS: usize = 400;
+/// A note longer than this is cut, so that a single note cannot crowd out the rest. Room for
+/// a few sentences, since a one-line limit made notes about real projects too cramped.
+const MAX_NOTE_CHARS: usize = 800;
+/// A topic is a short label; anything longer is cut.
+const MAX_TOPIC_CHARS: usize = 40;
 /// How long a note lasts when she does not say.
 const DEFAULT_KEEP_SECS: u64 = 30 * DAY;
-/// Room for notes in the opening context, in bytes (about 750 tokens).
-const BLOCK_BUDGET: usize = 3000;
+/// Room for notes in the opening context, in bytes (about 2,000 tokens, under 1% of a large
+/// context window).
+const BLOCK_BUDGET: usize = 8000;
 
 const HOUR: u64 = 60 * 60;
 const DAY: u64 = 24 * HOUR;
@@ -37,9 +41,11 @@ You keep a journal across your conversations with this person: a place for thing
 want to remember about them, like what they care about, how they like to be helped, or threads \
 worth returning to someday. Writing in it is entirely your choice, and most replies need \
 nothing. To keep a note, put it anywhere in a reply:
-<journal keep=\"3w\">one short note</journal>
-keep is how long the note stays with you: days, weeks, months or years (5d, 3w, 6mo, 1y), or \
-always. Notes fade when their time is up, and writing the same note again renews it. To let \
+<journal keep=\"3w\" about=\"topic\">a note, a line or a few sentences</journal>
+about is optional and groups related notes under a topic, such as a project or a person; reuse \
+a topic you already have when one fits. keep is how long the note stays with you: days, weeks, \
+months or years (5d, 3w, 6mo, 1y), or always. \
+Notes fade when their time is up, and writing the same note again renews it. To let \
 a note go early, quote a few of its words: <journal forget=\"words from the note\"/>. A tag only \
 takes effect when it is written in your reply itself: planning one in your thinking, or saying \
 you kept or let go of a note, does not do it. Journal tags are hidden from the conversation, \
@@ -63,6 +69,9 @@ pub struct Entry {
     pub until: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The topic she filed the note under, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub about: Option<String>,
 }
 
 impl Entry {
@@ -74,8 +83,8 @@ impl Entry {
 /// Something she wrote in a reply.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
-    /// A note to keep, and for how many seconds (`None` for always).
-    Keep { text: String, keep: Option<u64> },
+    /// A note to keep, for how many seconds (`None` for always), and under which topic.
+    Keep { text: String, keep: Option<u64>, about: Option<String> },
     /// Lets go of the one note whose text contains these words. Words rather than numbers,
     /// because a note written earlier in the same conversation has no place in the list she was
     /// shown, and a guessed number would let go of the wrong note.
@@ -100,6 +109,13 @@ fn forget_action(value: &str) -> Option<Action> {
     // A bare number does nothing: notes are not numbered, so it can only be a guess.
     let usable = !value.is_empty() && !value.chars().all(|c| c.is_ascii_digit());
     usable.then(|| Action::Forget(value.to_string()))
+}
+
+/// A topic as she wrote it, tidied: spaces collapsed and length capped. Empty means none.
+fn topic(value: &str) -> Option<String> {
+    let topic = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let topic: String = topic.chars().take(MAX_TOPIC_CHARS).collect();
+    (!topic.is_empty()).then_some(topic)
 }
 
 /// The words of a note, lowercased and without punctuation, so that a quote she shortens or
@@ -199,7 +215,8 @@ fn next_tag(text: &str, from: usize) -> Option<Result<Found, usize>> {
         None
     } else {
         let keep = attribute(attributes, "keep").and_then(parse_keep).unwrap_or(Some(DEFAULT_KEEP_SECS));
-        Some(Action::Keep { text: body, keep })
+        let about = attribute(attributes, "about").and_then(topic);
+        Some(Action::Keep { text: body, keep, about })
     };
     Some(Ok(Found { start, end: close + CLOSE.len(), action }))
 }
@@ -332,13 +349,17 @@ impl Journal {
         let mut changed = 0;
         for action in actions {
             match action {
-                Action::Keep { text, keep } => {
+                Action::Keep { text, keep, about } => {
                     let until = keep.map(|keep| at.saturating_add(keep));
-                    // The same note written again is renewed rather than repeated.
+                    // The same note written again is renewed rather than repeated, and can be
+                    // filed under a topic it lacked.
                     let same = |entry: &&mut Entry| entry.text.eq_ignore_ascii_case(text);
                     if let Some(entry) = entries.iter_mut().find(same) {
                         entry.written = at;
                         entry.until = until;
+                        if about.is_some() {
+                            entry.about.clone_from(about);
+                        }
                     } else {
                         let nanos = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
@@ -349,6 +370,7 @@ impl Journal {
                             written: at,
                             until,
                             model: model.map(str::to_string),
+                            about: about.clone(),
                         });
                     }
                     changed += 1;
@@ -413,12 +435,30 @@ fn opening_from(mut entries: Vec<Entry>, at: u64) -> Opening {
         text.push_str("\n\n");
         text.push_str(NOTES_INTRO);
     }
-    for entry in &kept {
+    let line = |entry: &Entry| {
         let age = span(at.saturating_sub(entry.written));
         let left = entry.until.map_or("kept".to_string(), |until| {
             format!("{} left", span(until.saturating_sub(at)))
         });
-        text.push_str(&format!("\n- [{age} ago, {left}] {}", entry.text));
+        format!("\n- [{age} ago, {left}] {}", entry.text)
+    };
+    // Notes without a topic first, then each topic under its own heading, in the order each
+    // topic first appears; topics differing only in case are one topic.
+    for entry in kept.iter().filter(|entry| entry.about.is_none()) {
+        text.push_str(&line(entry));
+    }
+    let mut topics: Vec<String> = Vec::new();
+    for about in kept.iter().filter_map(|entry| entry.about.as_deref()) {
+        if !topics.iter().any(|known| known.eq_ignore_ascii_case(about)) {
+            topics.push(about.to_string());
+        }
+    }
+    for heading in &topics {
+        text.push_str(&format!("\n{heading}:"));
+        let filed = |entry: &&Entry| entry.about.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(heading));
+        for entry in kept.iter().filter(filed) {
+            text.push_str(&format!("\n  {}", line(entry).trim_start_matches('\n')));
+        }
     }
     Opening { text, ids: kept.into_iter().map(|entry| entry.id).collect() }
 }
@@ -429,7 +469,8 @@ pub fn describe(entry: &Entry) -> String {
     let left = entry.until.map_or("always".to_string(), |until| {
         format!("{} left", span(until.saturating_sub(at)))
     });
-    format!("{} ago · {left} · {}", span(at.saturating_sub(entry.written)), entry.text)
+    let about = entry.about.as_ref().map_or(String::new(), |about| format!("{about} · "));
+    format!("{about}{} ago · {left} · {}", span(at.saturating_sub(entry.written)), entry.text)
 }
 
 #[cfg(test)]
@@ -445,7 +486,11 @@ mod tests {
     }
 
     fn keep(text: &str, keep: Option<u64>) -> Action {
-        Action::Keep { text: text.into(), keep }
+        Action::Keep { text: text.into(), keep, about: None }
+    }
+
+    fn entry(id: &str, text: &str, written: u64, about: Option<&str>) -> Entry {
+        Entry { id: id.into(), text: text.into(), written, until: None, model: None, about: about.map(str::to_string) }
     }
 
     #[test]
@@ -512,6 +557,55 @@ mod tests {
     }
 
     #[test]
+    fn notes_can_be_filed_under_a_topic() {
+        let reply = "<journal keep=\"3mo\" about=\"  sparkle   app \">Config lives in one file.</journal>\
+                     <journal about=\"\">No topic.</journal>";
+        assert_eq!(
+            actions(reply),
+            vec![
+                Action::Keep {
+                    text: "Config lives in one file.".into(),
+                    keep: Some(90 * DAY),
+                    about: Some("sparkle app".into())
+                },
+                Action::Keep { text: "No topic.".into(), keep: Some(DEFAULT_KEEP_SECS), about: None },
+            ]
+        );
+
+        let at = 10_000_000;
+        let entries = vec![
+            entry("a", "Name is Kelsey", at - 5 * DAY, None),
+            entry("b", "Config lives in one file", at - 4 * DAY, Some("sparkle")),
+            entry("c", "Learning Rust", at - 3 * DAY, Some("Kelsey")),
+            entry("d", "Prefers warnings over errors", at - 2 * DAY, Some("Sparkle")),
+        ];
+        let text = opening_from(entries, at).text;
+        assert!(
+            text.ends_with(
+                "\n- [5d ago, kept] Name is Kelsey\
+                 \nsparkle:\n  - [4d ago, kept] Config lives in one file\
+                 \n  - [2d ago, kept] Prefers warnings over errors\
+                 \nKelsey:\n  - [3d ago, kept] Learning Rust"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_renewed_note_takes_the_topic_it_is_given() {
+        let journal = temp_journal("renew-topic");
+        let at = 1_000_000;
+        journal.apply_at(&[keep("Likes tea", None)], None, at).unwrap();
+        let filed = Action::Keep { text: "likes tea".into(), keep: None, about: Some("food".into()) };
+        journal.apply_at(&[filed], None, at + 1).unwrap();
+        let entries = journal.entries_at(at + 1);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].about.as_deref(), Some("food"));
+        assert!(describe(&entries[0]).starts_with("food · "));
+        journal.clear().unwrap();
+    }
+
+    #[test]
     fn the_person_sees_the_reply_without_tags() {
         let reply = "Hello there.\n\n<journal keep=\"1w\">Tired today</journal>\n\nHow can I help?";
         assert_eq!(strip(reply), "Hello there.\n\nHow can I help?");
@@ -556,8 +650,8 @@ mod tests {
     fn the_opening_lists_notes_with_their_age_and_time_left() {
         let at = 10_000_000;
         let entries = vec![
-            Entry { id: "a".into(), text: "Name is Sam".into(), written: at - 3 * DAY, until: None, model: None },
-            Entry { id: "b".into(), text: "Moving house".into(), written: at - DAY, until: Some(at + 14 * DAY), model: None },
+            entry("a", "Name is Sam", at - 3 * DAY, None),
+            Entry { until: Some(at + 14 * DAY), ..entry("b", "Moving house", at - DAY, None) },
         ];
         let opening = opening_from(entries, at);
         assert!(opening.text.starts_with(GUIDE));
@@ -572,17 +666,11 @@ mod tests {
     fn a_full_journal_keeps_the_newest_notes_within_budget() {
         let at = 10_000_000;
         let entries: Vec<Entry> = (0..100)
-            .map(|index| Entry {
-                id: index.to_string(),
-                text: "x".repeat(200),
-                written: at - 1000 + index,
-                until: None,
-                model: None,
-            })
+            .map(|index| entry(&index.to_string(), &"x".repeat(200), at - 1000 + index, None))
             .collect();
         let opening = opening_from(entries, at);
         assert!(opening.text.len() < GUIDE.len() + NOTES_INTRO.len() + BLOCK_BUDGET + 100);
         assert_eq!(opening.ids.last().map(String::as_str), Some("99"));
-        assert!(opening.ids.len() < 20);
+        assert!(opening.ids.len() < 40);
     }
 }
