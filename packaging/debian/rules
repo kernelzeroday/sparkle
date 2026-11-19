@@ -1,0 +1,43 @@
+#!/usr/bin/make -f
+# Builds from the vendored crates in vendor/ (the orig-vendor tarball), fully offline.
+
+export CARGO_HOME = $(CURDIR)/debian/cargo-home
+# Generating the man page and completions runs the binary; keep it out of the builder's home.
+export HOME = $(CURDIR)/debian/home
+
+SPARKLE = target/release/sparkle
+GENERATED = debian/generated
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	mkdir -p .cargo
+	printf '%s\n' '[source.crates-io]' 'replace-with = "vendored-sources"' \
+		'[source.vendored-sources]' 'directory = "vendor"' >.cargo/config.toml
+
+override_dh_auto_build:
+	cargo build --release --locked --offline -p sparkle
+	mkdir -p $(GENERATED)
+	$(SPARKLE) man >$(GENERATED)/sparkle.1
+	$(SPARKLE) completions bash >$(GENERATED)/sparkle.bash
+	$(SPARKLE) completions zsh >$(GENERATED)/_sparkle
+	$(SPARKLE) completions fish >$(GENERATED)/sparkle.fish
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	# The end-to-end suites drive a pseudo-terminal and belong in development, not here.
+	cargo test --release --locked --offline -p sparkle-core -p sparkle-store -p sparkle-tui
+endif
+
+override_dh_auto_install:
+	install -Dm0755 $(SPARKLE) debian/sparkle/usr/bin/sparkle
+	install -Dm0644 $(GENERATED)/sparkle.1 debian/sparkle/usr/share/man/man1/sparkle.1
+	install -Dm0644 $(GENERATED)/sparkle.bash \
+		debian/sparkle/usr/share/bash-completion/completions/sparkle
+	install -Dm0644 $(GENERATED)/_sparkle debian/sparkle/usr/share/zsh/vendor-completions/_sparkle
+	install -Dm0644 $(GENERATED)/sparkle.fish \
+		debian/sparkle/usr/share/fish/vendor_completions.d/sparkle.fish
+
+override_dh_auto_clean:
+	rm -rf target .cargo $(CARGO_HOME) $(HOME) $(GENERATED)

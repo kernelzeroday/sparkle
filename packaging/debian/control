@@ -1,0 +1,24 @@
+Source: sparkle
+Section: utils
+Priority: optional
+Maintainer: sparkle contributors <noreply@github.com>
+Build-Depends: debhelper-compat (= 13),
+               cargo (>= 1.89),
+               rustc (>= 1.89),
+               gcc,
+               g++,
+               cmake,
+               make
+Standards-Version: 4.7.2
+Homepage: https://github.com/kernelzeroday/sparkle
+Vcs-Git: https://github.com/kernelzeroday/sparkle.git
+Rules-Requires-Root: no
+
+Package: sparkle
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: terminal-first chat and prompt tool for language models
+ sparkle is a terminal-first chat and prompt tool for language models, with a
+ full-screen chat interface and a pipe-friendly command line. It talks to any
+ OpenAI-compatible server, local or remote, and keeps conversations in a local
+ SQLite history.

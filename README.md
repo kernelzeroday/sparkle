@@ -153,7 +153,18 @@ Set `SPARKLE_REDUCED_MOTION=1` to turn animations off.
 
 ## Packaging
 
+Packages build offline from vendored crates. A commit tagged `v<version>` builds as that version;
+any other commit builds as a snapshot such as `0.1.0^git20261119.bb3f91733`.
+
 ```sh
-cargo install cargo-deb cargo-generate-rpm
-./scripts/package.sh   # writes .deb and .rpm files to dist/
+# Fedora and other RPM systems: SRPM and RPM in dist/rpmbuild/
+sudo dnf install rpm-build rust cargo gcc gcc-c++ cmake
+./scripts/build-rpm.sh                   # --without check skips the tests
+
+# Debian and Ubuntu: source package and .deb in dist/debbuild/
+sudo apt install build-essential devscripts debhelper cargo rustc cmake
+./scripts/build-deb.sh                   # -d builds with a rustup toolchain if rustc < 1.89
 ```
+
+Both run `scripts/make-sources.sh`, which writes the source tarball, the vendored crates, and the
+license list of everything compiled into the binary to `dist/sources/`.

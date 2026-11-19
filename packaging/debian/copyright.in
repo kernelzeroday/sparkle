@@ -1,0 +1,18 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: sparkle
+Upstream-Contact: https://github.com/kernelzeroday/sparkle/issues
+Source: https://github.com/kernelzeroday/sparkle
+
+Files: *
+Copyright: sparkle contributors
+License: Apache-2.0
+
+Files: vendor/*
+Copyright: The authors of each crate; see vendor/<crate>/ for its notices
+License: @LICENSE@
+Comment: Crates compiled into the binary, vendored so the package builds offline.
+ Each crate's own license files are in its directory under vendor/.
+
+License: Apache-2.0
+ On Debian systems, the full text of the Apache License, Version 2.0 can be
+ found in /usr/share/common-licenses/Apache-2.0.
