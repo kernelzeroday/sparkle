@@ -6,6 +6,7 @@ license.workspace = true
 description = "The full-screen chat interface for sparkle"
 
 [dependencies]
+base64.workspace = true
 crossterm.workspace = true
 futures-util.workspace = true
 sparkle-core.workspace = true

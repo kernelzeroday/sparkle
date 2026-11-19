@@ -11,7 +11,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
+use ratatui::buffer::Buffer;
+use unicode_width::UnicodeWidthStr;
 use futures_util::StreamExt;
 use sparkle_core::compact;
 use sparkle_core::context::{self, Fit, estimate_tokens};
@@ -30,6 +34,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
 
 use crate::picker::Picker;
+use crate::selection::{Point, Screen, Selection};
 use crate::theme::{Icons, Theme};
 
 pub const COMMANDS: &[(&str, &str)] = &[
@@ -52,6 +57,9 @@ const EFFORTS: [Option<&str>; 4] = [None, Some("low"), Some("medium"), Some("hig
 
 /// Lines one wheel step scrolls the conversation.
 const WHEEL_LINES: usize = 3;
+
+/// Clicks this close together, on the same cell, count as a double or triple click.
+const MULTI_CLICK: Duration = Duration::from_millis(400);
 
 /// How long the second ctrl+c or ctrl+d has to arrive.
 const EXIT_WINDOW: Duration = Duration::from_secs(2);
@@ -359,6 +367,14 @@ pub struct App {
     /// The note about sparkle as this conversation opened with it; fixed for the same reason as
     /// the journal, since it names today's date.
     pub setting_note: Option<String>,
+    /// Text highlighted with the mouse, in screen cells.
+    pub selection: Option<Selection>,
+    /// The screen as last drawn, for reading out a selection.
+    pub last_frame: Option<Buffer>,
+    /// Selected text waiting to be put on the clipboard by the terminal loop.
+    pub copied: Option<String>,
+    /// When and where the last click landed, and how many clicks in a row it was.
+    last_click: Option<(Instant, Point, u8)>,
     generation: u64,
     task: Option<JoinHandle<()>>,
     sender: UnboundedSender<StreamMessage>,
@@ -476,6 +492,10 @@ impl App {
                 .sparkle_context
                 .then(|| setting::note(&library::today(), session.journal.is_some())),
             sparkle_context: session.sparkle_context,
+            selection: None,
+            last_frame: None,
+            copied: None,
+            last_click: None,
             journal: session.journal,
             generation: 0,
             task: None,
@@ -561,21 +581,89 @@ impl App {
                     self.input.insert_str(text);
                 }
             },
-            Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => self.on_wheel(-1),
-                MouseEventKind::ScrollDown => self.on_wheel(1),
-                // Clicks and drags mean nothing here; skip the redraw.
-                _ => return,
-            },
+            Event::Mouse(mouse) => {
+                let at = (mouse.column, mouse.row);
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => self.on_wheel(-1),
+                    MouseEventKind::ScrollDown => self.on_wheel(1),
+                    MouseEventKind::Down(MouseButton::Left) if self.picker.is_none() => self.press(at),
+                    MouseEventKind::Drag(MouseButton::Left) if self.selection.is_some() => {
+                        if let Some(selection) = &mut self.selection {
+                            selection.head = at;
+                        }
+                        // A press that became a drag does not count toward a double click.
+                        self.last_click = None;
+                    }
+                    MouseEventKind::Up(MouseButton::Left) if self.selection.is_some() => self.release(),
+                    // Other buttons and plain movement mean nothing here; skip the redraw.
+                    _ => return,
+                }
+            }
             Event::Resize(..) => {}
             _ => return,
         }
         self.dirty = true;
     }
 
+    /// Starts a selection, or picks a word or line on a double or triple click.
+    fn press(&mut self, at: Point) {
+        let count = match self.last_click {
+            Some((when, place, count)) if place == at && when.elapsed() < MULTI_CLICK => count % 3 + 1,
+            _ => 1,
+        };
+        self.last_click = Some((Instant::now(), at, count));
+        self.selection = match count {
+            2 => Selection::word(&self.screen(), at),
+            3 => Selection::line(&self.screen(), at.1),
+            _ => Some(Selection::new(at)),
+        };
+    }
+
+    /// Copies what was selected when the button comes up. A plain click selects nothing.
+    fn release(&mut self) {
+        let Some(selection) = self.selection else { return };
+        if selection.is_empty() {
+            self.selection = None;
+            return;
+        }
+        let text = selection.text(&self.screen());
+        if text.trim().is_empty() {
+            return;
+        }
+        let count = text.chars().count();
+        self.notice = Some(format!("Copied {count} character{}", if count == 1 { "" } else { "s" }));
+        self.copied = Some(text);
+    }
+
+    /// The text of the screen as last drawn, one string per cell. Cells covered by a wide
+    /// character are left empty, so it is copied once.
+    pub fn screen(&self) -> Screen {
+        let Some(buffer) = &self.last_frame else { return Vec::new() };
+        let area = buffer.area;
+        (area.top()..area.bottom())
+            .map(|y| {
+                let mut row = Vec::with_capacity(usize::from(area.width));
+                let mut covered = 0;
+                for x in area.left()..area.right() {
+                    if covered > 0 {
+                        covered -= 1;
+                        row.push(String::new());
+                        continue;
+                    }
+                    let symbol = buffer[(x, y)].symbol();
+                    covered = symbol.width().saturating_sub(1);
+                    row.push(symbol.to_string());
+                }
+                row
+            })
+            .collect()
+    }
+
     /// The wheel scrolls whatever is being read: the prompt browser's list when it is open,
     /// otherwise the conversation. It never touches the input or its history.
     fn on_wheel(&mut self, direction: isize) {
+        // The text under a highlight moves with the scroll, so the highlight goes.
+        self.selection = None;
         if let Some(picker) = &mut self.picker {
             picker.move_by(direction);
             return;
@@ -618,6 +706,8 @@ impl App {
         // Any other key in between cancels a pending exit.
         let exit_pending = self.exit_armed.take().is_some_and(|armed| armed.elapsed() < EXIT_WINDOW);
         self.notice = None;
+        // Any key ends a selection, the way it does in a terminal.
+        self.selection = None;
         if self.picker.is_some() {
             self.on_picker_key(key);
             return;

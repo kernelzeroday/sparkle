@@ -4,6 +4,8 @@ pub mod anim;
 pub mod app;
 pub mod markdown;
 pub mod picker;
+pub mod clipboard;
+pub mod selection;
 pub mod theme;
 pub mod view;
 
@@ -67,11 +69,12 @@ impl InputThread {
     }
 }
 
-/// Asks for mouse button and wheel reports in SGR form, without movement reports. Without it,
-/// most terminals turn the wheel into arrow keys on this screen, which the input box reads as
-/// history recall. Shift+drag still selects text in most terminals.
-const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1006h";
-const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1000l";
+/// Asks for mouse button, wheel and drag reports in SGR form; movement is only reported while a
+/// button is held. Without it, most terminals turn the wheel into arrow keys on this screen, which
+/// the input box reads as history recall. Sparkle draws its own selection and copies on release;
+/// shift+drag still gives the terminal's own selection in most terminals.
+const MOUSE_ON: &[u8] = b"\x1b[?1002h\x1b[?1006h";
+const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1002l";
 
 fn enter_terminal(mouse: bool) -> io::Result<(DefaultTerminal, bool)> {
     let terminal = ratatui::try_init()?;
@@ -137,6 +140,7 @@ fn edit_in_editor(text: &str) -> io::Result<String> {
 /// Runs the chat until the user quits. Returns the conversation id, if one was saved.
 pub async fn run(session: ChatSession) -> io::Result<Option<String>> {
     let mouse = session.mouse;
+    let clipboard_method = clipboard::detect();
     let (mut app, mut receiver) = App::new(session);
     app.request_context_window();
     let (mut terminal, enhanced) = enter_terminal(mouse)?;
@@ -177,7 +181,13 @@ pub async fn run(session: ChatSession) -> io::Result<Option<String>> {
                 }
             }
         }
-        if app.action.take() == Some(Action::EditLastReply) {
+        if let Some(text) = app.copied.take()
+            && let Err(error) = clipboard::copy(&clipboard_method, &text, &mut stdout())
+        {
+            app.notice = Some(format!("Could not copy: {error}"));
+            app.dirty = true;
+        }
+                if app.action.take() == Some(Action::EditLastReply) {
             // The reader must stop first or it competes with the editor for keystrokes.
             input.stop();
             leave_terminal(enhanced, mouse);

@@ -49,7 +49,9 @@ Replies go to stdout. Reasoning and animation go to stderr, so pipes receive onl
 | `shift+tab` | Cycle reasoning effort |
 | `up`, `down` | Recall sent messages; `up` on an empty input takes back a queued one |
 | mouse wheel, `pgup`, `pgdn`, `shift+up`, `shift+down` | Scroll the conversation |
-| `shift` + drag | Select text (sparkle takes the wheel, so plain dragging may not select) |
+| drag | Select text and copy it when the button comes up |
+| double-click, triple-click | Copy a word, or a line |
+| `shift` + drag | The terminal's own selection, in most terminals |
 | `ctrl+c` | Stop the reply, or clear the input |
 | `ctrl+c` or `ctrl+d` twice | Exit, when the input is empty |
 
@@ -168,6 +170,11 @@ aliases = ["l"]
 ```
 
 Set `SPARKLE_REDUCED_MOTION=1` to turn animations off.
+
+Copied text goes to `wl-copy`, `xclip`, `xsel` or `pbcopy`, whichever suits the session, and
+otherwise to the terminal's own clipboard sequence (OSC 52), which is also what is used over SSH so
+the text reaches your machine rather than the server. Set `SPARKLE_CLIPBOARD` to `osc52`,
+`wl-copy`, `xclip`, `xsel`, `pbcopy` or `none` to choose.
 
 ## Packaging
 

@@ -530,6 +530,20 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if let Some(picker) = &app.picker {
         draw_picker(frame, app, picker);
     }
+    let buffer = frame.buffer_mut();
+    // Keep the screen as drawn, before highlighting, so a selection reads the real text.
+    app.last_frame = Some(buffer.clone());
+    if let Some(selection) = app.selection {
+        let area = buffer.area;
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                if selection.contains((x, y)) {
+                    let cell = &mut buffer[(x, y)];
+                    cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+                }
+            }
+        }
+    }
 }
 
 /// Below this the browser has no room for its list.
@@ -1129,6 +1143,83 @@ mod tests {
         assert!(!screen.contains("journal") && !screen.contains("parser"), "{screen}");
         assert!(screen.contains("✎ noted") && !screen.contains("let go"), "{screen}");
         journal.clear().unwrap();
+    }
+
+    fn mouse(app: &mut App, kind: crossterm::event::MouseEventKind, column: u16, row: u16) {
+        let event = crossterm::event::MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE };
+        app.on_terminal(Event::Mouse(event));
+    }
+
+    /// The row and column where `text` starts on the drawn screen.
+    fn find(screen: &str, text: &str) -> (u16, u16) {
+        for (row, line) in screen.lines().enumerate() {
+            if let Some(index) = line.find(text) {
+                let column = line[..index].chars().count();
+                return (column as u16, row as u16);
+            }
+        }
+        panic!("{text:?} not on screen:\n{screen}");
+    }
+
+    #[tokio::test]
+    async fn dragging_highlights_text_and_copies_it_on_release() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let events = vec![StreamEvent::Text("The quick brown fox jumps".into())];
+        let (mut app, mut receiver, _provider) = app_with(events, None);
+        type_text(&mut app, "hi");
+        enter(&mut app);
+        drain(&mut app, &mut receiver).await;
+        let drawn = screen(&mut app, 80, 20);
+        let (column, row) = find(&drawn, "quick");
+
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), column, row);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), column + 10, row);
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let cell = &terminal.backend().buffer()[(column + 2, row)];
+        assert!(cell.modifier.contains(Modifier::REVERSED), "the selection is highlighted");
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), column + 10, row);
+        assert_eq!(app.copied.as_deref(), Some("quick brown"));
+        assert_eq!(app.notice.as_deref(), Some("Copied 11 characters"));
+
+        // A key ends the selection; a plain click selects and copies nothing.
+        app.copied = None;
+        app.on_terminal(Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)));
+        assert!(app.selection.is_none());
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), column, row);
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), column, row);
+        assert!(app.copied.is_none() && app.selection.is_none());
+    }
+
+    #[tokio::test]
+    async fn double_and_triple_clicks_copy_a_word_and_a_line() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let events = vec![StreamEvent::Text("The quick brown fox jumps".into())];
+        let (mut app, mut receiver, _provider) = app_with(events, None);
+        type_text(&mut app, "hi");
+        enter(&mut app);
+        drain(&mut app, &mut receiver).await;
+        let (column, row) = find(&screen(&mut app, 80, 20), "brown");
+        let click = |app: &mut App| {
+            mouse(app, MouseEventKind::Down(MouseButton::Left), column + 1, row);
+            mouse(app, MouseEventKind::Up(MouseButton::Left), column + 1, row);
+        };
+        click(&mut app);
+        click(&mut app);
+        assert_eq!(app.copied.take().as_deref(), Some("brown"));
+        click(&mut app);
+        assert_eq!(app.copied.take().as_deref(), Some("The quick brown fox jumps"));
+    }
+
+    #[tokio::test]
+    async fn the_wheel_clears_a_selection_because_the_text_moves() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        screen(&mut app, 80, 20);
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 1, 1);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 5, 1);
+        mouse(&mut app, MouseEventKind::ScrollUp, 5, 1);
+        assert!(app.selection.is_none());
     }
 
     #[tokio::test]

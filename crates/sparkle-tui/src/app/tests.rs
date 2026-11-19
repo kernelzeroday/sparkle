@@ -1569,9 +1569,9 @@ async fn the_wheel_scrolls_the_conversation_and_leaves_the_input_alone() {
     press(&mut app, KeyCode::Up, KeyModifiers::NONE);
     assert_eq!(app.input.lines().join(""), "first");
 
-    // Clicks do nothing and do not even ask for a redraw.
+    // Other buttons do nothing and do not even ask for a redraw.
     app.dirty = false;
-    wheel(&mut app, MouseEventKind::Down(MouseButton::Left));
+    wheel(&mut app, MouseEventKind::Down(MouseButton::Right));
     assert!(!app.dirty);
 }
 

@@ -227,7 +227,7 @@ fn by_default_the_chat_tells_the_model_where_she_is() {
 fn the_mouse_wheel_scrolls_and_the_arrows_recall_messages() {
     let harness = Harness::new();
     let mut tui = Tui::open(&harness, &[]);
-    assert!(tui.raw().contains("\x1b[?1000h\x1b[?1006h"), "wheel reports are requested");
+    assert!(tui.raw().contains("\x1b[?1002h\x1b[?1006h"), "wheel and drag reports are requested");
     tui.ask(&harness, "first question");
     tui.wait_for("Hello world");
     let sent = harness.chat_requests().len();
@@ -244,7 +244,28 @@ fn the_mouse_wheel_scrolls_and_the_arrows_recall_messages() {
     harness.wait_for_requests(sent + 1);
     assert_eq!(contents(&harness.last_body()).last().unwrap(), "first question");
     tui.quit();
-    assert!(tui.raw().contains("\x1b[?1006l\x1b[?1000l"), "the terminal is given its mouse back");
+    assert!(tui.raw().contains("\x1b[?1006l\x1b[?1002l"), "the terminal is given its mouse back");
+}
+
+#[test]
+fn dragging_over_a_reply_copies_it_to_the_clipboard() {
+    let harness = Harness::new();
+    let mut tui = Tui::spawn(&harness, &[], &[("SPARKLE_CLIPBOARD", "osc52")]);
+    tui.wait_for("Chatting with mock");
+    tui.ask(&harness, "hello");
+    tui.wait_for("Hello world");
+    let screen = tui.screen();
+    let (row, line) = screen.lines().enumerate().find(|(_, line)| line.contains("Hello world")).unwrap();
+    let column = line[..line.find("Hello world").unwrap()].chars().count();
+    // SGR mouse reports count from 1: press, drag with the button held, release.
+    let (x, y) = (column + 1, row + 1);
+    tui.send(&format!("\x1b[<0;{x};{y}M"));
+    tui.send(&format!("\x1b[<32;{};{y}M", x + 10));
+    tui.send(&format!("\x1b[<0;{};{y}m", x + 10));
+    tui.wait_for("Copied 11 characters");
+    // "Hello world" in base64, in the terminal's clipboard sequence.
+    assert!(tui.raw().contains("\x1b]52;c;SGVsbG8gd29ybGQ=\x07"), "the text reached the clipboard");
+    tui.quit();
 }
 
 #[test]
@@ -253,7 +274,7 @@ fn mouse_reports_can_be_turned_off() {
     harness.write_file("config.toml", "mouse = false\n");
     let mut tui = Tui::open(&harness, &[]);
     tui.wait_for("Chatting with mock");
-    assert!(!tui.raw().contains("\x1b[?1000h"));
+    assert!(!tui.raw().contains("\x1b[?1002h"));
     tui.quit();
 }
 
