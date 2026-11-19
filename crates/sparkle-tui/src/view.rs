@@ -5,10 +5,12 @@ use sparkle_core::context::{
     self, Fit, compact_count, estimate_tokens, format_bytes, size_label, usage_label,
 };
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap};
+use ratatui_textarea::TextArea;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::anim;
@@ -370,8 +372,24 @@ fn status_line(app: &App, width: u16) -> Line<'static> {
     Line::from(left)
 }
 
+/// Display rows the input needs at this outer width, counting soft-wrapped lines, up to the cap.
+fn input_rows(input: &TextArea<'_>, width: u16) -> u16 {
+    // The textarea lays out wrapped lines only while drawing, so draw it off screen at the real
+    // width first. Each display row then starts at a distinct text position, and rows past the
+    // end clamp to the last one, which is where the count stops.
+    let area = Rect::new(0, 0, width, MAX_INPUT_LINES + 2);
+    input.render(area, &mut Buffer::empty(area));
+    let mut rows = 1;
+    while rows < MAX_INPUT_LINES
+        && input.screen_to_data(rows as usize, 0) != input.screen_to_data(rows as usize - 1, 0)
+    {
+        rows += 1;
+    }
+    rows
+}
+
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
-    let input_lines = (app.input.lines().len() as u16).clamp(1, MAX_INPUT_LINES);
+    let input_lines = input_rows(&app.input, frame.area().width);
     let [transcript, activity, input, status] = Layout::vertical([
         Constraint::Min(1),
         Constraint::Length(1),
@@ -699,6 +717,30 @@ mod tests {
         let screen = screen(&mut app, 80, 24);
         assert!(screen.contains("Chatting with mock"), "{screen}");
         assert!(screen.contains("@ mock"), "{screen}");
+    }
+
+    #[tokio::test]
+    async fn long_input_wraps_and_the_box_grows_to_show_it() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        let words: Vec<String> = (0..30).map(|n| format!("word{n:02}")).collect();
+        type_text(&mut app, &words.join(" "));
+
+        let screen = screen(&mut app, 40, 24);
+        for word in &words {
+            assert!(screen.contains(word.as_str()), "{word} missing\n{screen}");
+        }
+        // 30 seven-wide words fill 38 columns about five to a row, so six text rows plus borders.
+        let boxed = screen.lines().filter(|line| line.starts_with('│')).count();
+        assert!(boxed >= 6, "{screen}");
+    }
+
+    #[tokio::test]
+    async fn short_input_keeps_a_single_row_box() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        type_text(&mut app, "hello");
+        let screen = screen(&mut app, 40, 24);
+        let boxed = screen.lines().filter(|line| line.starts_with('│')).count();
+        assert_eq!(boxed, 1, "{screen}");
     }
 
     #[tokio::test]

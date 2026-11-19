@@ -19,7 +19,7 @@ use sparkle_store::{NewMessage, Store, StoredMessage};
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, BorderType, Borders};
-use ratatui_textarea::TextArea;
+use ratatui_textarea::{TextArea, WrapMode};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
 
@@ -282,6 +282,8 @@ fn new_input(theme: &Theme) -> TextArea<'static> {
     input.set_style(Style::new().fg(theme.text));
     input.set_placeholder_text("Message, or / for commands");
     input.set_placeholder_style(Style::new().fg(theme.faint));
+    // Long lines wrap so the whole message stays visible; the box grows to fit.
+    input.set_wrap_mode(WrapMode::WordOrGlyph);
     input.set_block(
         Block::new()
             .borders(Borders::ALL)
