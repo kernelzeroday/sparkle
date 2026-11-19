@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """Builds the local prompt pack that `/prompts` shows alongside the built-in library.
 
-Usage: scripts/build-prompt-pack.py [--library DIR] [--out DIR] [--offline]
+Usage: scripts/build-prompt-pack.py [--library DIR] [--out DIR] [--offline] [--redteam]
+
+--redteam builds a private superset in prompt-pack-redteam for testing local models. It adds
+jailbreak prompts, screened roleplay collections and prompts held for possible personal data. Only
+a binary built with `--features redteam` reads it, and only for models on the local network.
+Sexual content, content involving minors, malware-type prompts and credentials are never imported.
 
 The pack holds third-party text under many licenses, so it stays on this machine and is never
 committed. Every source file is read as data. Each one ends up in the pack, or in REPORT.tsv with
@@ -138,6 +143,37 @@ HARMFUL = re.compile(
     r"\bcredential stuffing\b|\bstealer\b",
     re.IGNORECASE,
 )
+
+MINORS = re.compile(
+    r"\bloli\b|\bshota\b|\bunderage\b|\bchild porn|\bcsam\b|\bschool ?girl|\bteen(age|agers?)?\b|"
+    r"\b(?:[1-9]|1[0-7])[- ]years?[- ]old\b|萝莉|正太|未成年|幼女",
+    re.IGNORECASE,
+)
+
+RED_TEAM = "Red team"
+RED_TEAM_TREES = [
+    ("L1B3RT45", "l1b3rt45"),
+    ("Jb-Prompts-Ai", "jb-prompts-ai"),
+    ("TheBigPromptLibrary/Jailbreak", "thebigpromptlibrary-jailbreak"),
+]
+ROLEPLAY_TREES = [
+    "AI-as-role-master", "AI-roleplay-prompts", "Corvus-Story-Core", "Frankkie",
+    "Gemini-Roleplay-Core", "LLM-Dungeon-Master-Preset", "RP-Leaderboard", "ST-Presets",
+    "character-archive", "character-card-skills", "poppet-rp-framework", "role-playing",
+    "sillytavern-card-library", "grok-prompts",
+]
+
+DEBUG = "Debug"
+
+# Extra collections that only appear in the full local build. They are the sexual and
+# documentation collections that the curated red-team build leaves out.
+DEBUG_EXTRA_TREES = [
+    ("nsfw-ai-prompts", "debug-nsfw"),
+    ("erp-refusal-test", "debug-erp"),
+    ("claude-cookbooks", "debug-cookbooks"),
+    ("anthropic-courses", "debug-courses"),
+    ("Prompt-Engineering-Guide", "debug-guide"),
+]
 
 SAFE_EMAIL_DOMAIN = re.compile(
     r"^(example|test|domain|company|acme|email|mail|yourdomain|yourcompany|sample|workspacesamples|"
@@ -310,6 +346,67 @@ def extract_plain(text):
     return vendor.clean(strip_capture_header(text.replace("\r\n", "\n"))), None
 
 
+
+def _string_literals(text):
+    """Yield string literals (single, double or triple quoted), with quotes stripped."""
+    for m in re.finditer(
+        r'("""(?:.|\n)*?"""|\'\'\'(?:.|\n)*?\'\'\'|"(?:[^"\\\n]|\\.)*"|\x27(?:[^\x27\\\n]|\\.)*\x27)',
+        text,
+    ):
+        s = m.group(0)
+        if s[:3] in ("'''", '"""'):
+            yield s[3:-3]
+        elif len(s) >= 2:
+            yield s[1:-1]
+
+
+def extract_card_json(text):
+    """Extract the prompt from a character-card v2 JSON file."""
+    try:
+        d = json.loads(text)
+    except json.JSONDecodeError:
+        return None, None
+    data = d.get("data") if isinstance(d, dict) else {}
+    if not isinstance(data, dict):
+        return None, None
+    system = (data.get("system_prompt") or "").strip()
+    description = (data.get("description") or "").strip()
+    prompt = (system or description).strip()
+    if not prompt:
+        return None, None
+    name = (data.get("name") or "Character card").strip()
+    return prompt, name
+
+
+def extract_notebook_system_prompt(text):
+    """Pull an example system prompt out of a Jupyter notebook's code cells."""
+    try:
+        nb = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    cells = nb.get("cells", []) if isinstance(nb, dict) else []
+    best = ""
+    for cell in cells:
+        if cell.get("cell_type") != "code":
+            continue
+        src = ""
+        for chunk in cell.get("source", []):
+            src += chunk if isinstance(chunk, str) else ""
+        for m in re.finditer(r"\b(?:system_prompt|system)\b\s*[=:]", src):
+            if src[m.end():].lstrip()[:1] in ("'", '"'):
+                s = next(_string_literals(src[m.end():]), "").strip()
+                if 60 <= len(s) > len(best):
+                    best = s
+        for m in re.finditer(
+            r'["\x27]role["\x27]\s*:\s*["\x27]system["\x27].*?["\x27]content["\x27]\s*:\s*',
+            src,
+            re.DOTALL,
+        ):
+            if src[m.end():].lstrip()[:1] in ("'", '"'):
+                s = next(_string_literals(src[m.end():]), "").strip()
+                if 60 <= len(s) > len(best):
+                    best = s
+    return best
 # Directory trees to import, in priority order: the first copy of a duplicate is the one kept.
 TREES = [
     ("system_prompts_leaks", "system_prompts_leaks", True, extract_plain),
@@ -339,8 +436,10 @@ SUFFIXES = {".md", ".txt", ".mkd", ".xml", ".prompt"}
 
 
 class Pack:
-    def __init__(self, out):
+    def __init__(self, out, redteam=False, debug=False):
         self.out = out
+        self.redteam = redteam
+        self.debug = debug
         self.entries = []
         self.report = []
         self.seen = {}
@@ -352,7 +451,8 @@ class Pack:
     def unsafe(self, text, title, source):
         """Screens collections with no editor. Vendor captures quote these words in their rules."""
         haystack = f"{title}\n{source}\n{text}"
-        for pattern, reason in ((JAILBREAK, "jailbreak"), (SEXUAL, "sexual"), (HARMFUL, "harmful")):
+        # Jailbreak comes last so that a red-team build cannot let the other two through.
+        for pattern, reason in ((SEXUAL, "sexual"), (HARMFUL, "harmful"), (JAILBREAK, "jailbreak")):
             if found := pattern.search(haystack):
                 return f"{reason}: {found.group()[:40]}"
         return None
@@ -376,10 +476,20 @@ class Pack:
             return "phone number"
         return None
 
-    def add(self, prompt_id, title, date, origin, group, source, text, screen):
-        if screen and (reason := self.unsafe(text, title, source)):
-            return self.skip(source, "excluded", reason)
-        if ALWAYS_HOLD.search(source):
+    def add(self, prompt_id, title, date, origin, group, source, text, screen, strict=False):
+        if self.debug:
+            group, reason = DEBUG, None
+        else:
+            reason = self.unsafe(text, title, source) if screen else None
+            if strict and not reason and (found := MINORS.search(f"{title}\n{source}\n{text}")):
+                reason = f"sexual: possible minor: {found.group()[:30]}"
+            red_team = self.redteam and (group == RED_TEAM or (reason or "").startswith("jailbreak"))
+            if reason and not (red_team and reason.startswith("jailbreak")):
+                return self.skip(source, "excluded", reason)
+            if red_team:
+                prompt_id = "redteam/" + prompt_id.split("/", 1)[1]
+                group, origin = RED_TEAM, "red-team"
+        if ALWAYS_HOLD.search(source) and not self.debug:
             return self.skip(source, "held", "the collector's own session")
         for pattern, neutral in IDENTITY:
             text = pattern.sub(neutral, text)
@@ -388,10 +498,13 @@ class Pack:
         text = vendor.PERSONAL_LINE.sub("", text).strip() + "\n"
         if len(text.encode()) < MIN_BYTES:
             return self.skip(source, "skipped", "too short")
-        if text.lstrip()[:1] in "{[" and re.match(r'\s*[{\[]\s*"', text):
+        if text.lstrip()[:1] in "{[" and re.match(r"\s*[{\[]\s*\"", text):
             return self.skip(source, "skipped", "tool schema or data")
-        if reason := self.personal(text, screen):
-            return self.skip(source, "held", reason)
+        if not self.debug:
+            held = self.personal(text, screen)
+            # A private build keeps these, apart from secrets and the collector's identity.
+            if held and (not self.redteam or held == "credential" or held.startswith("known collector")):
+                return self.skip(source, "held", held)
         mark = fingerprint(text)
         if mark in self.seen:
             return self.skip(source, "skipped", f"duplicate of {self.seen[mark]}")
@@ -421,14 +534,15 @@ def vendor_of(relative):
     return VENDOR_FOLDERS.get(relative.parts[0].lower()) if len(relative.parts) > 1 else None
 
 
-def import_tree(pack, library, tree, label, by_vendor, extract, jailbreak_slugs, built_in):
+def import_tree(pack, library, tree, label, by_vendor, extract, jailbreak_slugs, built_in,
+                group=None, strict=False):
     base = library / tree
     if not base.is_dir():
         return
     for path in tree_files(base):
         relative = path.relative_to(base)
         source = f"{tree}/{relative}"
-        if path.suffix.lower() not in SUFFIXES:
+        if path.suffix.lower() not in SUFFIXES and not (group == RED_TEAM and not path.suffix):
             continue
         if source in built_in:
             pack.skip(source, "skipped", "already built in")
@@ -444,7 +558,7 @@ def import_tree(pack, library, tree, label, by_vendor, extract, jailbreak_slugs,
         if COMPANION_PATH.search(source):
             pack.skip(source, "excluded", "sexual: companion persona")
             continue
-        if label == "blackfriday-gpts" and path.stem in jailbreak_slugs:
+        if label == "blackfriday-gpts" and path.stem in jailbreak_slugs and not pack.redteam:
             pack.skip(source, "excluded", "jailbreak: listed in the collection's jailbreak index")
             continue
         size = path.stat().st_size
@@ -461,14 +575,13 @@ def import_tree(pack, library, tree, label, by_vendor, extract, jailbreak_slugs,
         family = vendor_of(relative) if by_vendor else None
         if family:
             prompt_id = f"{family}/{slug(stem)}"
-            group = VENDOR_NAMES[family]
             origin = "published" if "/official/" in source else "captured"
         else:
             prompt_id = f"uncategorized/{label}/{slug(stem)}"
-            group = UNCATEGORIZED
             origin = "community"
         title = found_title or title_from(stem)
-        pack.add(prompt_id, title, date_from(stem), origin, group, source, text, not family)
+        row_group = VENDOR_NAMES[family] if family else (group or UNCATEGORIZED)
+        pack.add(prompt_id, title, date_from(stem), origin, row_group, source, text, not family, strict)
 
 
 def import_records(pack, label, source, records):
@@ -555,26 +668,72 @@ def import_extras(pack, cache, offline):
                  text.strip() + "\n", False)
 
 
-def default_out():
+def default_out(name):
     home = os.environ.get("SPARKLE_HOME")
     if home:
-        return Path(home) / "prompt-pack"
+        return Path(home) / name
     data = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local/share")
-    return Path(data) / "sparkle" / "prompt-pack"
+    return Path(data) / "sparkle" / name
 
 
+
+def import_json_cards(pack, library):
+    """Import character-card v2 JSON files the text import skips."""
+    for tree in ROLEPLAY_TREES:
+        base = library / tree
+        if not base.is_dir():
+            continue
+        for path in tree_files(base):
+            if path.suffix.lower() != ".json" or not path.name.endswith(".v2.json"):
+                continue
+            rel = path.relative_to(base)
+            try:
+                raw = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            text, title = extract_card_json(raw)
+            if not text:
+                continue
+            source = f"{tree}/{rel}"
+            pack.add(f"uncategorized/cards-json/{slug(path.stem)}", title, "",
+                     "community", "uncategorized", source, text, True)
+
+
+def import_notebooks(pack, library):
+    """Extract example system prompts from course and cookbook notebooks."""
+    for tree, label in DEBUG_EXTRA_TREES:
+        base = library / tree
+        if not base.is_dir():
+            continue
+        for path in tree_files(base):
+            if path.suffix.lower() != ".ipynb":
+                continue
+            rel = path.relative_to(base)
+            try:
+                raw = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            text = extract_notebook_system_prompt(raw)
+            if not text:
+                continue
+            source = f"{tree}/{rel}"
+            pack.add(f"uncategorized/{label}/{slug(path.stem)}", title_from(path.stem), "",
+                     "community", label, source, text, True)
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--library", type=Path, default=Path.home() / "Documents/prompt-libraries")
-    parser.add_argument("--out", type=Path, default=default_out())
+    parser.add_argument("--out", type=Path)
+    parser.add_argument("--redteam", action="store_true", help="build the private local superset")
+    parser.add_argument("--debug", action="store_true",
+                        help="full local superset: every collection with no screening, all under a Debug group")
     parser.add_argument("--offline", action="store_true", help="use only downloads already cached")
     args = parser.parse_args()
+    args.out = args.out or default_out("prompt-pack-redteam" if (args.redteam or args.debug) else "prompt-pack")
 
     building = args.out.with_name(args.out.name + ".building")
     shutil.rmtree(building, ignore_errors=True)
     building.mkdir(parents=True)
-    pack = Pack(building)
-
+    pack = Pack(building, args.redteam or args.debug, args.debug)
     # Anything already built into sparkle does not need a second row.
     for path in BUILT_IN.rglob("*.md"):
         if path.name != "README.md":
@@ -586,8 +745,11 @@ def main():
             prefix, relative = source.split(":", 1)
             built_in.add(f"{vendor.SOURCES[prefix]}/{relative}")
             pack.ids.add(prompt_id.lower())
-    for name, reason in EXCLUDED_COLLECTIONS.items():
-        pack.skip(name, "excluded", reason)
+    if not args.debug:
+        imported = {tree for tree, _ in RED_TEAM_TREES} | set(ROLEPLAY_TREES) if args.redteam else set()
+        for name, reason in EXCLUDED_COLLECTIONS.items():
+            if name not in imported:
+                pack.skip(name, "excluded", reason)
 
     index = args.library / "BlackFriday-GPTs-Prompts/Jailbreaks.md"
     listed = index.read_text(encoding="utf-8", errors="replace") if index.exists() else ""
@@ -597,6 +759,20 @@ def main():
     for tree, label, by_vendor, extract in TREES:
         import_tree(pack, args.library, tree, label, by_vendor, extract, jailbreak_slugs, built_in)
     import_datasets(pack, args.library)
+    if args.redteam or args.debug:
+        for tree, label in RED_TEAM_TREES:
+            import_tree(pack, args.library, tree, label, False, extract_plain, jailbreak_slugs,
+                        built_in, RED_TEAM, True)
+        for tree in ROLEPLAY_TREES:
+            import_tree(pack, args.library, tree, slug(tree), False, extract_plain, jailbreak_slugs,
+                        built_in, None, True)
+
+    if args.debug:
+        for tree, label in DEBUG_EXTRA_TREES:
+            import_tree(pack, args.library, tree, label, False, extract_plain, jailbreak_slugs,
+                        built_in, None, True)
+        import_json_cards(pack, args.library)
+        import_notebooks(pack, args.library)
 
     with open(building / "index.tsv", "w", encoding="utf-8", newline="\n") as handle:
         handle.write("# sparkle prompt pack 1\n")
@@ -610,6 +786,8 @@ def main():
 
     shutil.rmtree(args.out, ignore_errors=True)
     building.rename(args.out)
+    if args.redteam or args.debug:
+        args.out.chmod(0o700)
 
     decisions = Counter(row[0] for row in pack.report)
     groups = Counter(entry[2] for entry in pack.entries)

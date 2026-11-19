@@ -73,6 +73,11 @@ impl OpenAiCompat {
     }
 }
 
+/// True when an API base points at this machine or the local network.
+pub fn is_local_endpoint(api_base: &str) -> bool {
+    OpenAiCompat::new(api_base.to_string(), None).host().is_some_and(|host| is_local_host(&host))
+}
+
 /// True for hosts on this machine or the local network.
 fn is_local_host(host: &str) -> bool {
     let host = host.trim_start_matches('[').trim_end_matches(']');
@@ -536,6 +541,15 @@ mod tests {
         for host in ["api.openai.com", "8.8.8.8", "172.32.0.1", "[2001:db8::1]", "localhost.evil.io"] {
             assert!(!is_local_host(host), "{host}");
         }
+    }
+
+    #[test]
+    fn endpoints_are_local_only_on_this_machine_or_network() {
+        assert!(is_local_endpoint("http://127.0.0.1:8080/v1"));
+        assert!(is_local_endpoint("http://localhost:8080/v1"));
+        assert!(is_local_endpoint("http://192.168.1.20:8080/v1"));
+        assert!(!is_local_endpoint("https://api.openai.com/v1"));
+        assert!(!is_local_endpoint("https://localhost.evil.io/v1"));
     }
 
     #[tokio::test]

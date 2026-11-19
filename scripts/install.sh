@@ -3,7 +3,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-cargo build --release --locked -p sparkle
+# --redteam installs a private build that can read the local red-team prompt pack.
+features=()
+if [[ "${1:-}" == "--redteam" ]]; then
+    features=(--features redteam)
+fi
+cargo build --release --locked -p sparkle "${features[@]}"
 
 binary=target/release/sparkle
 assets=$(mktemp -d)

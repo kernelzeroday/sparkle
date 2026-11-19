@@ -118,7 +118,7 @@ impl Picker {
             entries.push(entry);
         }
         collections.sort();
-        if !collections.is_empty() {
+        if !collections.is_empty() && entries.iter().any(|entry| entry.group == UNCATEGORIZED) {
             groups.push(UNCATEGORIZED.to_string());
         }
 

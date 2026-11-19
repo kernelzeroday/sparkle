@@ -54,6 +54,8 @@ pub struct ResolvedModel {
     pub id: String,
     pub wire_name: String,
     pub provider: Arc<dyn Provider>,
+    /// The local prompt pack this model may use.
+    pub prompt_pack: Option<PathBuf>,
 }
 
 pub type Resolver = Box<dyn Fn(&str) -> Result<ResolvedModel, String> + Send>;
@@ -82,8 +84,6 @@ pub struct ChatSession {
     pub warn_percent: u8,
     /// Where the default system prompt is saved. Without one, defaults cannot be changed.
     pub default_prompt_file: Option<PathBuf>,
-    /// The local prompt pack, when this machine has one.
-    pub prompt_pack: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -354,7 +354,7 @@ impl App {
             warn_percent: session.warn_percent,
             default_prompt,
             default_prompt_file: session.default_prompt_file,
-            prompt_pack: session.prompt_pack,
+            prompt_pack: session.model.prompt_pack,
             exit_armed: None,
             last_line_count: 0,
             reply_filter: PrefillFilter::default(),
@@ -610,9 +610,14 @@ impl App {
                     self.model = model.id;
                     self.wire_model = model.wire_name;
                     self.provider = model.provider;
+                    self.prompt_pack = model.prompt_pack;
                     self.measured_context = None;
                     self.request_context_window();
-                    self.notice = Some(format!("Switched to {}", self.model));
+                    self.notice = Some(if self.clear_unavailable_prompt() {
+                        format!("Switched to {}. Its red-team prompt was cleared", self.model)
+                    } else {
+                        format!("Switched to {}", self.model)
+                    });
                 }
                 Err(error) => self.notice = Some(error),
             },
@@ -687,6 +692,19 @@ impl App {
         } else {
             self.notice = Some(format!("Unknown persona '{name}'"));
         }
+    }
+
+    /// Red-team prompts only run on local models, so they do not follow a switch to a remote one.
+    fn clear_unavailable_prompt(&mut self) -> bool {
+        let Some(name) = self.persona.as_deref().filter(|name| name.starts_with("redteam/")) else {
+            return false;
+        };
+        if library::load(name, self.prompt_pack.as_deref()).is_ok() {
+            return false;
+        }
+        self.persona = None;
+        self.system = None;
+        true
     }
 
     fn prompts_command(&mut self, argument: &str) {
@@ -1483,6 +1501,7 @@ pub(crate) mod tests {
                 id: "mock".into(),
                 wire_name: "mock-wire".into(),
                 provider,
+                prompt_pack: None,
             },
             resolver: Box::new(|name| Err(format!("unknown model {name}"))),
             system: None,
@@ -1501,7 +1520,6 @@ pub(crate) mod tests {
             smart_titles: false,
             warn_percent: 80,
             default_prompt_file: None,
-            prompt_pack: None,
         }
     }
 
@@ -1530,6 +1548,20 @@ pub(crate) mod tests {
         let file = std::env::temp_dir().join(unique).join("default_prompt.txt");
         let _ = std::fs::remove_file(&file);
         file
+    }
+
+    #[tokio::test]
+    async fn a_red_team_prompt_is_cleared_when_its_pack_is_unavailable() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        app.persona = Some("redteam/example/prompt".into());
+        app.system = Some("text".into());
+        assert!(app.clear_unavailable_prompt());
+        assert_eq!((app.persona.as_deref(), app.system.as_deref()), (None, None));
+
+        app.persona = Some("openai/gpt-3.5".into());
+        app.system = Some("text".into());
+        assert!(!app.clear_unavailable_prompt());
+        assert_eq!(app.system.as_deref(), Some("text"));
     }
 
     #[tokio::test]

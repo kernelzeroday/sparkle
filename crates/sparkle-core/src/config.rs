@@ -46,6 +46,11 @@ impl Paths {
         self.data_dir.join("prompt-pack")
     }
 
+    /// The private superset of the pack, read only by builds with the `redteam` feature.
+    pub fn redteam_pack(&self) -> PathBuf {
+        self.data_dir.join("prompt-pack-redteam")
+    }
+
     /// Holds the name of the default system prompt, set from `/prompts` or `sparkle prompts`.
     pub fn default_prompt(&self) -> PathBuf {
         self.config_dir.join("default_prompt.txt")

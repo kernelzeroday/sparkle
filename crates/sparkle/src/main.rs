@@ -93,9 +93,9 @@ fn prepare(args: &ModelArgs) -> Result<RunContext> {
 
     let inherit = args.system.is_none() && history.is_empty();
     let named = match (&args.system_prompt, &args.persona) {
-        (Some(name), _) => Some(library::load(name, Some(&paths.prompt_pack()))?),
+        (Some(name), _) => Some(library::load(name, Some(&pack_for(&paths, &model)))?),
         (None, Some(name)) => Some(persona_prompt(name)?),
-        (None, None) if inherit => inherited_prompt(&paths, &registry)?,
+        (None, None) if inherit => inherited_prompt(&paths, &registry, &model)?,
         (None, None) => None,
     };
     let earlier_system =
@@ -141,6 +141,27 @@ fn prepare(args: &ModelArgs) -> Result<RunContext> {
     })
 }
 
+/// The pack a model may use. The private red-team pack is limited to local models.
+fn pack_for(paths: &Paths, model: &ModelEntry) -> std::path::PathBuf {
+    #[cfg(feature = "redteam")]
+    if sparkle_core::openai::is_local_endpoint(&model.api_base)
+        && paths.redteam_pack().join("index.tsv").is_file()
+    {
+        return paths.redteam_pack();
+    }
+    let _ = model;
+    paths.prompt_pack()
+}
+
+/// The pack to list and print from, where no request is being sent.
+fn browsing_pack(paths: &Paths) -> std::path::PathBuf {
+    if cfg!(feature = "redteam") && paths.redteam_pack().join("index.tsv").is_file() {
+        paths.redteam_pack()
+    } else {
+        paths.prompt_pack()
+    }
+}
+
 fn persona_prompt(name: &str) -> Result<Loaded> {
     let persona = personas::find(name)
         .ok_or_else(|| anyhow!("unknown persona '{name}'. Run `sparkle personas` to see the list"))?;
@@ -149,9 +170,9 @@ fn persona_prompt(name: &str) -> Result<Loaded> {
 
 /// The prompt a new conversation starts with when none was asked for. A saved default that has
 /// since gone missing must not stop sparkle from running.
-fn inherited_prompt(paths: &Paths, registry: &Registry) -> Result<Option<Loaded>> {
+fn inherited_prompt(paths: &Paths, registry: &Registry, model: &ModelEntry) -> Result<Option<Loaded>> {
     if let Some(name) = library::saved_default(&paths.default_prompt()) {
-        match library::load(&name, Some(&paths.prompt_pack())) {
+        match library::load(&name, Some(&pack_for(paths, model))) {
             Ok(prompt) => return Ok(Some(prompt)),
             Err(error) => eprintln!("Warning: ignoring the default system prompt: {error}"),
         }
@@ -365,7 +386,8 @@ async fn run_chat(args: ChatArgs) -> Result<()> {
 
     let settings = context.registry.settings.clone();
     let default_prompt_file = Some(context.paths.default_prompt());
-    let prompt_pack = Some(context.paths.prompt_pack());
+    let paths = context.paths.clone();
+    let prompt_pack = Some(pack_for(&paths, &context.model));
     let show_reasoning = !thinking_hidden(args.hide_reasoning, &context.registry);
     let title = match &context.conversation_id {
         Some(id) => context.store.conversation_title(id)?,
@@ -376,13 +398,15 @@ async fn run_chat(args: ChatArgs) -> Result<()> {
     let resolver = Box::new(move |name: &str| {
         let model = registry.resolve(name).map_err(|error| error.to_string())?;
         let provider = registry.provider(&model, key.as_deref());
-        Ok(ResolvedModel { id: model.id, wire_name: model.wire_name, provider })
+        let prompt_pack = Some(pack_for(&paths, &model));
+        Ok(ResolvedModel { id: model.id, wire_name: model.wire_name, provider, prompt_pack })
     });
     let session = ChatSession {
         model: ResolvedModel {
             id: context.model.id,
             wire_name: context.model.wire_name,
             provider: context.provider,
+            prompt_pack,
         },
         resolver,
         system: context.system,
@@ -402,7 +426,6 @@ async fn run_chat(args: ChatArgs) -> Result<()> {
         smart_titles: settings.smart_titles.unwrap_or(true),
         warn_percent: settings.warn_percent(),
         default_prompt_file,
-        prompt_pack,
     };
     if let Some(conversation) = sparkle_tui::run(session).await? {
         println!("Continue this conversation with: sparkle chat --cid {conversation}");
@@ -530,7 +553,7 @@ fn list_models(json_output: bool) -> Result<()> {
 fn list_prompts(json_output: bool) -> Result<()> {
     let paths = Paths::discover()?;
     let default = library::saved_default(&paths.default_prompt());
-    let pack = library::PromptPack::open(&paths.prompt_pack());
+    let pack = library::PromptPack::open(&browsing_pack(&paths));
     let built_in = library::PROMPTS.iter().map(|prompt| {
         let family = prompt.family_name();
         (prompt.id, prompt.title, family, prompt.date, prompt.origin.label(), prompt.text.len())
@@ -570,7 +593,7 @@ fn prompts_command(action: Option<PromptsAction>) -> Result<()> {
     match action.unwrap_or(PromptsAction::List { json: false }) {
         PromptsAction::List { json } => list_prompts(json),
         PromptsAction::Show { name } => {
-            let pack = Paths::discover()?.prompt_pack();
+            let pack = browsing_pack(&Paths::discover()?);
             print!("{}", library::load(&name, Some(&pack))?.text);
             Ok(())
         }
@@ -588,7 +611,7 @@ fn prompts_command(action: Option<PromptsAction>) -> Result<()> {
                 library::save_default(&file, None)?;
                 println!("Removed the default system prompt");
             } else {
-                let stored = library::storable_name(&name, Some(&paths.prompt_pack()))?;
+                let stored = library::storable_name(&name, Some(&browsing_pack(&paths)))?;
                 library::save_default(&file, Some(&stored))?;
                 println!("New chats will start with {stored}");
             }
@@ -704,6 +727,32 @@ mod tests {
 
         push_message(&mut messages, Message::new(Role::Assistant, "answer"));
         assert_eq!(messages.len(), 2);
+    }
+
+    fn model_at(api_base: &str) -> ModelEntry {
+        ModelEntry {
+            id: "m".into(),
+            wire_name: "m".into(),
+            api_base: api_base.into(),
+            key_name: None,
+            key_env: None,
+            aliases: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn remote_models_never_receive_the_red_team_pack() {
+        let home = std::env::temp_dir().join(format!("sparkle-main-{}", std::process::id()));
+        std::fs::create_dir_all(home.join("prompt-pack-redteam")).unwrap();
+        std::fs::write(home.join("prompt-pack-redteam/index.tsv"), "# pack\n").unwrap();
+        let paths = Paths { config_dir: home.clone(), data_dir: home.clone(), llm_dir: home.clone() };
+
+        let remote = pack_for(&paths, &model_at("https://api.openai.com/v1"));
+        assert_eq!(remote, paths.prompt_pack());
+        let local = pack_for(&paths, &model_at("http://127.0.0.1:8080/v1"));
+        let expected = if cfg!(feature = "redteam") { paths.redteam_pack() } else { paths.prompt_pack() };
+        assert_eq!(local, expected);
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

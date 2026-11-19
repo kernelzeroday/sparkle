@@ -10,6 +10,10 @@ readme = "../../README.md"
 name = "sparkle"
 path = "src/main.rs"
 
+[features]
+# Reads the private red-team prompt pack for local models. Never enabled for release packages.
+redteam = []
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
