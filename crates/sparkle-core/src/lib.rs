@@ -12,6 +12,7 @@ pub mod personas;
 pub mod prefill;
 pub mod provider;
 pub mod schema;
+pub mod setting;
 pub mod sse;
 pub mod title;
 pub mod types;

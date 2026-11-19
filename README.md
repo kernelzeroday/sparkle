@@ -124,6 +124,16 @@ new chats start with it; turning it off forgets it. Text set with `/system` is k
 An explicit `--system`, `--system-prompt` or `--persona` takes priority over the default, and a
 continued conversation keeps the system prompt it started with.
 
+Most library prompts were written for another product and describe its features, such as web
+search, artifacts or memory of past chats, so a model will offer them. The chat therefore opens
+the system prompt with a short note saying she is in sparkle, with today's date, that no tools or
+other apps' features exist here, and how her journal works; when a library prompt is chosen, it
+also closes with a one-line reminder. Tested on a local model, this stopped false claims about
+memory and tools under the Claude, Gemini and GPT prompts, and stopped GPT-5.4's prompt from
+producing fake tool calls. Prompts built around their own app's tools (the Gemini app, GPT-5.4
+Thinking) can still pull a little. `sparkle_context = false` turns the note off; one-shot prompts
+never get it.
+
 The vendored prompts belong to their vendors and are not covered by sparkle's license. See
 [crates/sparkle-core/prompts/README.md](crates/sparkle-core/prompts/README.md) for where each one
 came from. `scripts/vendor-prompts.py` regenerates them from `scripts/prompt-manifest.tsv`.
@@ -145,6 +155,7 @@ smart_titles = true  # let the model name each new chat
 context_warn_percent = 80 # warn when a request fills this much of the context window
 retries = 5          # resend a failed request this many times, backing off 1s, 2s, 4s…
 journal = true       # let the chat model keep a journal about you (see above)
+sparkle_context = true # tell the chat model she is in sparkle (see System prompts)
 
 [[models]]
 id = "local"

@@ -16,6 +16,7 @@ use futures_util::StreamExt;
 use sparkle_core::compact;
 use sparkle_core::context::{self, Fit, estimate_tokens};
 use sparkle_core::journal::{self, Journal, Opening};
+use sparkle_core::setting;
 use sparkle_core::library;
 use sparkle_core::prefill::PrefillFilter;
 use sparkle_core::title;
@@ -94,6 +95,8 @@ pub struct ChatSession {
     pub show_thinking_file: Option<PathBuf>,
     /// The model's journal, when it is on.
     pub journal: Option<Journal>,
+    /// Tell the model she is in sparkle, ahead of any chosen system prompt.
+    pub sparkle_context: bool,
     /// Where the default system prompt is saved. Without one, defaults cannot be changed.
     pub default_prompt_file: Option<PathBuf>,
 }
@@ -322,6 +325,10 @@ pub struct App {
     /// The journal as this conversation opened with it. It is not refreshed mid-conversation,
     /// so the start of every request stays the same and server prompt caches stay valid.
     pub journal_opening: Option<Opening>,
+    sparkle_context: bool,
+    /// The note about sparkle as this conversation opened with it; fixed for the same reason as
+    /// the journal, since it names today's date.
+    pub setting_note: Option<String>,
     generation: u64,
     task: Option<JoinHandle<()>>,
     sender: UnboundedSender<StreamMessage>,
@@ -435,6 +442,10 @@ impl App {
             history_index: None,
             history_draft: String::new(),
             journal_opening: session.journal.as_ref().map(Journal::opening),
+            setting_note: session
+                .sparkle_context
+                .then(|| setting::note(&library::today(), session.journal.is_some())),
+            sparkle_context: session.sparkle_context,
             journal: session.journal,
             generation: 0,
             task: None,
@@ -490,7 +501,7 @@ impl App {
         pending += self.fragments.iter().map(String::len).sum::<usize>();
         pending += self.prefill.as_ref().map_or(0, String::len);
         if self.measured_context.is_none() {
-            pending += self.system.as_ref().map_or(0, String::len) + self.journal_len();
+            pending += self.system.as_ref().map_or(0, String::len) + self.added_system_len();
         }
         (measured + estimate_tokens(pending), self.measured_context.is_none() || pending > 0)
     }
@@ -501,7 +512,7 @@ impl App {
             self.turns.iter().filter(|turn| turn.role.is_some()).map(Turn::wire_len).sum();
         let fragments: usize = self.fragments.iter().map(String::len).sum();
         let prefill = self.prefill.as_ref().map_or(0, String::len);
-        estimate_tokens(prompt_bytes + self.journal_len() + turns + fragments + prefill)
+        estimate_tokens(prompt_bytes + self.added_system_len() + turns + fragments + prefill)
     }
 
     /// A warning when the next request is close to or beyond the model's context window.
@@ -902,23 +913,31 @@ impl App {
         messages
     }
 
-    fn journal_len(&self) -> usize {
-        self.journal_opening.as_ref().map_or(0, |opening| opening.text.len() + 2)
+    /// Bytes sparkle adds around the system prompt the person chose.
+    fn added_system_len(&self) -> usize {
+        self.wire_system().map_or(0, |system| system.len())
+            - self.system.as_ref().map_or(0, String::len)
     }
 
-    /// The system prompt as the model receives it, with the journal after it.
-    fn wire_system(&self) -> Option<String> {
-        let journal = self.journal_opening.as_ref().map(|opening| opening.text.as_str());
-        match (&self.system, journal) {
-            (Some(system), Some(journal)) => Some(format!("{system}\n\n{journal}")),
-            (Some(system), None) => Some(system.clone()),
-            (None, journal) => journal.map(str::to_string),
+    /// The system prompt as the model receives it: where she is, then the chosen prompt, then
+    /// her journal, and a closing reminder when a chosen prompt could pull her elsewhere.
+    pub fn wire_system(&self) -> Option<String> {
+        let mut parts: Vec<&str> = Vec::new();
+        parts.extend(self.setting_note.as_deref());
+        parts.extend(self.system.as_deref());
+        parts.extend(self.journal_opening.as_ref().map(|opening| opening.text.as_str()));
+        if self.setting_note.is_some() && self.system.is_some() {
+            parts.push(setting::REMINDER);
         }
+        (!parts.is_empty()).then(|| parts.join("\n\n"))
     }
 
-    /// Opens the journal afresh for a new conversation.
+    /// Opens the journal and the note about sparkle afresh for a new conversation.
     pub(super) fn reopen_journal(&mut self) {
         self.journal_opening = self.journal.as_ref().map(Journal::opening);
+        self.setting_note = self
+            .sparkle_context
+            .then(|| setting::note(&library::today(), self.journal.is_some()));
     }
 
     /// Keeps the notes the model wrote in a finished reply, and counts them on the reply.

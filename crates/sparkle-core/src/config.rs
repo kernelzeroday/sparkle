@@ -105,6 +105,9 @@ pub struct Settings {
     pub retries: Option<u32>,
     /// Give the chat model a journal she can keep notes about the person in. Defaults to true.
     pub journal: Option<bool>,
+    /// Tell the chat model she is in sparkle, so a prompt written for another product does not
+    /// lead her to offer its features. Defaults to true.
+    pub sparkle_context: Option<bool>,
     pub models: Vec<ModelConfig>,
 }
 

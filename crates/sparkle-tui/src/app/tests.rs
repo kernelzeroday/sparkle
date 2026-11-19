@@ -90,6 +90,7 @@ fn session_with(
         retries: 5,
         show_thinking_file: None,
         journal: None,
+        sparkle_context: false,
         default_prompt_file: None,
     }
 }
@@ -1490,4 +1491,39 @@ async fn a_prompt_file_chosen_in_the_chat_is_remembered_by_its_full_path() {
     say(&mut app, &mut receiver, &format!("/prompts file {}", prompt.display())).await;
     let saved = library::saved_default(&file).unwrap();
     assert_eq!(std::path::Path::new(&saved), prompt.canonicalize().unwrap());
+}
+
+#[tokio::test]
+async fn the_model_is_told_where_she_is_around_the_chosen_prompt() {
+    let (mut app, mut receiver, provider) = app_with(reply_events(), None);
+    app.sparkle_context = true;
+    let journal = with_journal(&mut app, "setting");
+    app.system = Some("You are Claude, made by Anthropic.".into());
+    say(&mut app, &mut receiver, "hi").await;
+
+    let system = provider.requests.lock().unwrap()[0].messages[0].content.clone();
+    let note = system.find("# Where you are").unwrap();
+    let chosen = system.find("You are Claude").unwrap();
+    let guide = system.find("You keep a journal").unwrap();
+    let reminder = system.find(setting::REMINDER).unwrap();
+    assert!(note < chosen && chosen < guide && guide < reminder, "{system}");
+    assert!(system.contains(&format!("Today's date is {}.", library::today())));
+    assert!(system.ends_with(setting::REMINDER));
+
+    // Without a chosen prompt there is nothing to remind her away from.
+    say(&mut app, &mut receiver, "/prompts off").await;
+    say(&mut app, &mut receiver, "/new").await;
+    say(&mut app, &mut receiver, "hi again").await;
+    let system = provider.requests.lock().unwrap()[1].messages[0].content.clone();
+    assert!(system.starts_with("# Where you are") && !system.contains("Reminder:"), "{system}");
+    journal.clear().unwrap();
+}
+
+#[tokio::test]
+async fn the_note_about_sparkle_can_be_turned_off() {
+    let (mut app, mut receiver, provider) = app_with(reply_events(), None);
+    app.system = Some("Be kind".into());
+    say(&mut app, &mut receiver, "hi").await;
+    assert_eq!(provider.requests.lock().unwrap()[0].messages[0].content, "Be kind");
+    assert_eq!(app.wire_system().as_deref(), Some("Be kind"));
 }

@@ -247,7 +247,7 @@ fn fill_date(text: &str, date: &str) -> String {
 }
 
 /// Today's UTC date as `YYYY-MM-DD`.
-fn today() -> String {
+pub fn today() -> String {
     let seconds = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |time| time.as_secs());
     civil_date(seconds / 86_400)
 }

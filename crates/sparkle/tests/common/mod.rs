@@ -172,15 +172,19 @@ impl Harness {
         harness
     }
 
-    /// Writes a file into sparkle's home. Most tests check exact requests, so the chat journal,
-    /// which adds to the system prompt, stays off unless a config names it.
+    /// Writes a file into sparkle's home. Most tests check exact requests, so the chat journal and
+    /// the note about sparkle, which add to the system prompt, stay off unless a config names them.
     pub fn write_file(&self, name: &str, contents: &str) -> String {
         let path = self.home.join(name);
-        let contents = if name == "config.toml" && !contents.contains("journal") {
-            format!("journal = false\n{contents}")
-        } else {
-            contents.to_string()
-        };
+        let mut contents = contents.to_string();
+        if name == "config.toml" {
+            if !contents.contains("journal") {
+                contents.insert_str(0, "journal = false\n");
+            }
+            if !contents.contains("sparkle_context") {
+                contents.insert_str(0, "sparkle_context = false\n");
+            }
+        }
         std::fs::write(&path, contents).unwrap();
         path.to_str().unwrap().to_string()
     }

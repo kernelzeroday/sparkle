@@ -442,6 +442,7 @@ async fn run_chat(args: ChatArgs) -> Result<()> {
         warn_percent: settings.warn_percent(),
         retries: settings.retries.unwrap_or(5),
         show_thinking_file,
+        sparkle_context: settings.sparkle_context.unwrap_or(true),
         journal: settings
             .journal
             .unwrap_or(true)

@@ -205,6 +205,24 @@ fn the_chat_gives_the_model_a_journal_but_one_shot_prompts_do_not() {
     off.quit();
 }
 
+#[test]
+fn by_default_the_chat_tells_the_model_where_she_is() {
+    let harness = Harness::new();
+    harness.write_file("config.toml", "journal = true\nsparkle_context = true\n");
+    let mut tui = Tui::open(&harness, &["--system", "You are Claude."]);
+    tui.ask(&harness, "hello");
+    tui.wait_for("Hello world");
+    let system = harness.last_body()["messages"][0]["content"].as_str().unwrap().to_string();
+    assert!(system.starts_with("# Where you are\nThis conversation is happening in sparkle"), "{system}");
+    assert!(system.contains("\n\nYou are Claude.\n\nYou keep a journal"), "{system}");
+    assert!(system.ends_with(sparkle_core::setting::REMINDER), "{system}");
+    tui.quit();
+
+    // One-shot prompts send exactly what was asked for.
+    assert!(harness.run(&["--system", "You are Claude.", "hello"]).status.success());
+    assert_eq!(harness.last_body()["messages"][0]["content"], "You are Claude.");
+}
+
 // Leaving the chat
 
 #[test]
