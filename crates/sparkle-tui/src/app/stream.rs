@@ -1,14 +1,25 @@
 //! Streaming requests, event handling, cancellation and persistence.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
 use sparkle_core::prefill::PrefillFilter;
 use sparkle_core::{ChatRequest, Role, StreamEvent};
 use sparkle_store::NewMessage;
 
-use super::{App, Payload, Phase, StreamMessage, Turn};
+use super::{App, Payload, Phase, Retry, StreamMessage, Turn};
+
+/// The longest wait between attempts.
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Exponential backoff with up to 25% jitter, so that many clients do not retry in step.
+pub(super) fn backoff(base: Duration, attempt: u32) -> Duration {
+    let exponential = base.saturating_mul(1 << attempt.saturating_sub(1).min(16)).min(MAX_BACKOFF);
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |time| time.subsec_nanos());
+    let jitter = exponential.mul_f64(f64::from(nanos % 1000) / 4000.0);
+    exponential + jitter
+}
 
 impl App {
     pub(super) fn begin_reply(&mut self) {
@@ -36,21 +47,48 @@ impl App {
         self.prompt_progress = None;
         self.generation += 1;
 
+        self.retrying = None;
+
         let generation = self.generation;
         let sender = self.sender.clone();
         let provider = Arc::clone(&self.provider);
+        let (base, max) = (self.retry_base, self.max_retries);
         self.task = Some(tokio::spawn(async move {
-            let result = async {
-                let mut stream = provider.stream(&request).await?;
-                while let Some(event) = stream.next().await {
-                    let payload = Payload::Event(event?);
-                    if sender.send(StreamMessage { generation, payload }).is_err() {
-                        break;
+            let mut attempt: u32 = 0;
+            let result = loop {
+                // Only a request that has produced nothing yet is safe to send again;
+                // retrying after partial output would repeat text.
+                let mut started = false;
+                let result = async {
+                    let mut stream = provider.stream(&request).await?;
+                    while let Some(event) = stream.next().await {
+                        let payload = Payload::Event(event?);
+                        started = true;
+                        if sender.send(StreamMessage { generation, payload }).is_err() {
+                            break;
+                        }
                     }
+                    Ok::<(), sparkle_core::Error>(())
                 }
-                Ok::<(), sparkle_core::Error>(())
-            }
-            .await;
+                .await;
+                match result {
+                    Err(error) if !started && error.is_transient() && attempt < max => {
+                        attempt += 1;
+                        let delay = backoff(base, attempt);
+                        let payload = Payload::Retrying(Retry {
+                            attempt,
+                            max,
+                            at: Instant::now() + delay,
+                            reason: error.to_string(),
+                        });
+                        if sender.send(StreamMessage { generation, payload }).is_err() {
+                            return;
+                        }
+                        tokio::time::sleep(delay).await;
+                    }
+                    other => break other,
+                }
+            };
             let payload = match result {
                 Ok(()) => Payload::Ended,
                 Err(error) => Payload::Failed(error.to_string()),
@@ -77,6 +115,11 @@ impl App {
             return;
         }
         self.dirty = true;
+        if let Payload::Retrying(retry) = message.payload {
+            self.retrying = Some(retry);
+            return;
+        }
+        self.retrying = None;
         if self.phase == Phase::Compacting {
             self.on_compaction(message.payload);
             return;
@@ -90,7 +133,7 @@ impl App {
                 self.finish();
             }
             Payload::Ended => self.finish(),
-            Payload::Title(_) | Payload::ContextWindow(_) => {}
+            Payload::Title(_) | Payload::ContextWindow(_) | Payload::Retrying(_) => {}
         }
     }
 
@@ -147,6 +190,7 @@ impl App {
         }
         if self.stop_compaction().is_some() {
             self.notice = Some("Compaction stopped. The conversation is unchanged".into());
+            self.restore_queued();
             return;
         }
         if let Some(turn) = self.turns.last_mut() {
@@ -159,6 +203,7 @@ impl App {
         let duration = Self::elapsed_ms(self.started);
         let thought = Self::elapsed_ms(self.first_reasoning);
         self.phase = Phase::Idle;
+        self.retrying = None;
         self.started = None;
         self.prompt_progress = None;
         self.task = None;
@@ -189,6 +234,14 @@ impl App {
                 Err(error) => self.notice = Some(format!("Could not save history: {error}")),
             }
         }
+        let completed = turn.error.is_none() && !turn.interrupted;
+        // Even a stopped reply keeps the notes it finished writing.
+        self.keep_journal_notes();
         self.request_title();
+        if completed {
+            self.run_queued();
+        } else {
+            self.restore_queued();
+        }
     }
 }

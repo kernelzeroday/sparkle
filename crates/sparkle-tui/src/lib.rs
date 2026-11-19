@@ -156,9 +156,9 @@ pub async fn run(session: ChatSession) -> io::Result<Option<String>> {
                     app.on_stream(message);
                 }
             }
-            _ = ticker.tick(), if app.busy() || app.exit_pending() => {
+            _ = ticker.tick(), if app.animating() || app.exit_pending() => {
                 app.expire_exit();
-                if app.busy() {
+                if app.animating() {
                     app.frame = app.frame.wrapping_add(1);
                     app.dirty = true;
                 }

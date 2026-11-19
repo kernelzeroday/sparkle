@@ -5,7 +5,9 @@ use sparkle_core::{Usage, library, personas};
 
 use crate::picker::Picker;
 
-use super::{Action, App, COMMANDS, EFFORTS, Phase, Turn, new_input};
+use sparkle_core::journal;
+
+use super::{Action, App, COMMANDS, EFFORTS, Turn, new_input};
 
 impl App {
     pub(super) fn cycle_effort(&mut self) {
@@ -17,11 +19,6 @@ impl App {
     }
 
     pub(super) fn submit(&mut self) {
-        if self.busy() {
-            let activity = if self.phase == Phase::Compacting { "compacting" } else { "replying" };
-            self.notice = Some(format!("Still {activity}. Press esc to stop."));
-            return;
-        }
         let text = self.input.lines().join("\n");
         let text = text.trim();
         if text.is_empty() {
@@ -29,6 +26,17 @@ impl App {
         }
         let text = text.to_string();
         self.input = new_input(&self.theme);
+        self.remember_input(&text);
+        if self.busy() {
+            // Sent once the current reply finishes; up takes it back to change it.
+            self.queued.push(text);
+            return;
+        }
+        self.dispatch(text);
+    }
+
+    /// Runs a command or sends a message.
+    pub(super) fn dispatch(&mut self, text: String) {
         self.scroll = 0;
         // A first word like /etc/hosts is a path in a message, not a command.
         let first_word = text.split_whitespace().next().unwrap_or("");
@@ -47,9 +55,10 @@ impl App {
                 let mut help: Vec<String> =
                     COMMANDS.iter().map(|(name, about)| format!("{name:<10} {about}")).collect();
                 help.push(String::new());
-                help.push("enter send   shift+enter or ctrl+j newline   esc stop".into());
+                help.push("enter send (queues while busy)   shift+enter or ctrl+j newline   esc stop".into());
                 help.push("ctrl+t thinking   ctrl+o compaction summary   shift+tab effort".into());
-                help.push("pgup/pgdn scroll   tab complete command   ctrl+c/d twice exit".into());
+                help.push("up/down recall sent messages   pgup/pgdn or shift+up/down scroll".into());
+                help.push("tab complete command   ctrl+c/d twice exit".into());
                 self.turns.push(Turn::notice(help.join("\n")));
             }
             "/new" | "/clear" => {
@@ -58,9 +67,11 @@ impl App {
                 self.reset_title();
                 self.total_usage = Usage::default();
                 self.measured_context = None;
+                self.reopen_journal();
                 self.notice = Some("Started a new conversation".into());
             }
             "/quit" | "/exit" => self.should_quit = true,
+            "/journal" => self.show_journal(argument),
             "/model" if argument.is_empty() => {
                 self.notice = Some(format!("Current model: {}", self.model));
             }
@@ -250,4 +261,32 @@ impl App {
         Ok(())
     }
 
+
+    /// Lets the person read or clear the model's journal. Reading it is their choice; nothing
+    /// here is shown in the conversation unless they ask.
+    fn show_journal(&mut self, argument: &str) {
+        let Some(journal) = &self.journal else {
+            self.notice = Some("The journal is off. Set journal = true in config.toml".into());
+            return;
+        };
+        match argument {
+            "" => {
+                let entries = journal.entries();
+                let text = if entries.is_empty() {
+                    "The journal is empty".to_string()
+                } else {
+                    let mut lines = vec![format!("Journal, {} notes:", entries.len())];
+                    lines.extend(entries.iter().map(|entry| format!("  {}", journal::describe(entry))));
+                    lines.join("\n")
+                };
+                self.turns.push(Turn::notice(text));
+            }
+            "clear" => match journal.clear() {
+                Ok(()) => self.notice = Some("Journal cleared. Open chats keep what they started with".into()),
+                Err(error) => self.notice = Some(format!("Could not clear the journal: {error}")),
+            },
+            "path" => self.notice = Some(journal.path().display().to_string()),
+            _ => self.notice = Some("Usage: /journal [clear|path]".into()),
+        }
+    }
 }

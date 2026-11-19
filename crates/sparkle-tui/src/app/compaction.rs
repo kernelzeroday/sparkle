@@ -87,7 +87,7 @@ impl App {
             }
             Payload::Failed(error) => self.finish_compaction(Err(error)),
             Payload::Ended => self.finish_compaction(Ok(())),
-            Payload::Title(_) | Payload::ContextWindow(_) => {}
+            Payload::Title(_) | Payload::ContextWindow(_) | Payload::Retrying(_) => {}
         }
     }
 
@@ -95,6 +95,7 @@ impl App {
     pub(super) fn stop_compaction(&mut self) -> Option<Compaction> {
         self.compaction.as_ref()?;
         self.phase = Phase::Idle;
+        self.retrying = None;
         self.started = None;
         self.prompt_progress = None;
         self.task = None;
@@ -112,9 +113,13 @@ impl App {
                 .ok_or("the model returned an empty summary")?;
             self.commit_compaction(compaction.method, compaction.replaced, text, compaction.usage)
         });
-        if let Err(reason) = applied {
-            let text = format!("Compaction failed, so the conversation is unchanged: {reason}");
-            self.turns.push(Turn::notice(text));
+        match applied {
+            Ok(()) => self.run_queued(),
+            Err(reason) => {
+                let text = format!("Compaction failed, so the conversation is unchanged: {reason}");
+                self.turns.push(Turn::notice(text));
+                self.restore_queued();
+            }
         }
     }
 

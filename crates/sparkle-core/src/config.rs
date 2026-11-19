@@ -55,6 +55,33 @@ impl Paths {
     pub fn default_prompt(&self) -> PathBuf {
         self.config_dir.join("default_prompt.txt")
     }
+
+    /// The chat model's journal, one note per line.
+    pub fn journal(&self) -> PathBuf {
+        self.data_dir.join("journal.jsonl")
+    }
+
+    /// Remembers whether thinking was last shown or hidden with ctrl+t in the chat.
+    pub fn show_thinking(&self) -> PathBuf {
+        self.config_dir.join("show_thinking")
+    }
+}
+
+/// A remembered on/off choice, or `None` when none was saved or the file is unreadable.
+pub fn saved_switch(file: &std::path::Path) -> Option<bool> {
+    match std::fs::read_to_string(file).ok()?.trim() {
+        "on" => Some(true),
+        "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Saves an on/off choice for the next run.
+pub fn save_switch(file: &std::path::Path, on: bool) -> std::io::Result<()> {
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(file, if on { "on\n" } else { "off\n" })
 }
 
 /// `config.toml`. Every field is optional.
@@ -73,6 +100,11 @@ pub struct Settings {
     pub smart_titles: Option<bool>,
     /// Warn once a request fills this percentage of the context window. Defaults to 80.
     pub context_warn_percent: Option<u8>,
+    /// Times to resend a request that failed before any reply arrived, waiting longer each
+    /// time. Defaults to 5; 0 turns retrying off.
+    pub retries: Option<u32>,
+    /// Give the chat model a journal she can keep notes about the person in. Defaults to true.
+    pub journal: Option<bool>,
     pub models: Vec<ModelConfig>,
 }
 

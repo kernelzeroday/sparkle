@@ -10,6 +10,8 @@ pub(crate) struct FakeProvider {
     /// Replies for the next requests, used ahead of `events`.
     pub queued: Mutex<VecDeque<Vec<StreamEvent>>>,
     pub requests: Mutex<Vec<ChatRequest>>,
+    /// Errors returned instead of a stream, one per request, before any reply is used.
+    pub failures: Mutex<VecDeque<sparkle_core::Error>>,
 }
 
 impl FakeProvider {
@@ -21,6 +23,9 @@ impl FakeProvider {
 impl Provider for FakeProvider {
     fn stream<'a>(&'a self, request: &'a ChatRequest) -> BoxFuture<'a, Result<EventStream>> {
         self.requests.lock().unwrap().push(request.clone());
+        if let Some(error) = self.failures.lock().unwrap().pop_front() {
+            return Box::pin(async move { Err(error) });
+        }
         let queued = self.queued.lock().unwrap().pop_front();
         let events = queued.unwrap_or_else(|| self.events.clone());
         Box::pin(async move {
@@ -46,8 +51,10 @@ pub(crate) fn app_with(
         events,
         queued: Mutex::new(VecDeque::new()),
         requests: Mutex::new(Vec::new()),
+        failures: Mutex::new(VecDeque::new()),
     });
-    let (app, receiver) = App::new(session_with(provider.clone(), store, None, Vec::new()));
+    let (mut app, receiver) = App::new(session_with(provider.clone(), store, None, Vec::new()));
+    app.retry_base = Duration::ZERO;
     (app, receiver, provider)
 }
 
@@ -80,6 +87,9 @@ fn session_with(
         title: None,
         smart_titles: false,
         warn_percent: 80,
+        retries: 5,
+        show_thinking_file: None,
+        journal: None,
         default_prompt_file: None,
     }
 }
@@ -801,14 +811,14 @@ async fn a_fresh_summary_has_nothing_more_to_compact() {
 }
 
 #[tokio::test]
-async fn compaction_is_refused_while_a_reply_is_streaming() {
+async fn compaction_waits_in_the_queue_while_a_reply_is_streaming() {
     let (mut app, _receiver, provider) = app_with(long_reply(), None);
     type_text(&mut app, "hi");
     press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
     type_text(&mut app, "/compact");
     press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-    assert_eq!(app.notice.as_deref(), Some("Still replying. Press esc to stop."));
-    assert_eq!(app.input.lines().join(""), "/compact", "the command is not lost");
+    assert_eq!(app.queued, vec!["/compact".to_string()], "the command is not lost");
+    assert!(app.input_is_empty());
     assert_eq!(app.phase, Phase::Waiting);
     tokio::task::yield_now().await;
     assert_eq!(provider.requests.lock().unwrap().len(), 1);
@@ -822,8 +832,141 @@ async fn other_input_waits_while_compacting() {
     assert_eq!(app.phase, Phase::Compacting);
     type_text(&mut app, "next question");
     press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-    assert_eq!(app.notice.as_deref(), Some("Still compacting. Press esc to stop."));
-    assert_eq!(app.input.lines().join(""), "next question");
+    assert_eq!(app.queued, vec!["next question".to_string()]);
+    assert_eq!(app.phase, Phase::Compacting);
+}
+
+#[tokio::test]
+async fn queued_messages_go_out_in_order_after_the_reply() {
+    let (mut app, mut receiver, provider) = app_with(reply_events(), None);
+    type_text(&mut app, "one");
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    type_text(&mut app, "two");
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    type_text(&mut app, "three");
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(app.queued.len(), 2);
+    drain(&mut app, &mut receiver).await;
+    assert!(app.queued.is_empty());
+    let users: Vec<String> = app
+        .turns
+        .iter()
+        .filter(|turn| turn.role == Some(Role::User))
+        .map(|turn| turn.text.clone())
+        .collect();
+    assert_eq!(users, ["one", "two", "three"]);
+    assert_eq!(provider.requests.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn stopping_a_reply_puts_queued_messages_back_in_the_input() {
+    let (mut app, _receiver, provider) = app_with(long_reply(), None);
+    type_text(&mut app, "one");
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    type_text(&mut app, "two");
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    assert!(!app.busy());
+    assert!(app.queued.is_empty());
+    assert_eq!(app.input.lines().join("\n"), "two");
+    tokio::task::yield_now().await;
+    assert!(provider.requests.lock().unwrap().len() <= 1, "nothing was sent after stopping");
+    let users = app.turns.iter().filter(|turn| turn.role == Some(Role::User)).count();
+    assert_eq!(users, 1);
+}
+
+#[tokio::test]
+async fn up_takes_back_the_latest_queued_message() {
+    let (mut app, _receiver, _provider) = app_with(long_reply(), None);
+    type_text(&mut app, "one");
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    type_text(&mut app, "two");
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+    assert!(app.queued.is_empty());
+    assert_eq!(app.input.lines().join(""), "two");
+}
+
+#[tokio::test]
+async fn up_and_down_move_through_sent_messages_and_keep_the_draft() {
+    let (mut app, mut receiver, _provider) = app_with(reply_events(), None);
+    say(&mut app, &mut receiver, "first").await;
+    say(&mut app, &mut receiver, "second\nline").await;
+    type_text(&mut app, "draft");
+    press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+    assert_eq!(app.input.lines().join("\n"), "second\nline");
+    // The cursor lands at the top, so the next up goes on to the older message.
+    press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+    assert_eq!(app.input.lines().join("\n"), "first");
+    press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+    assert_eq!(app.input.lines().join("\n"), "first", "stops at the oldest");
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    assert_eq!(app.input.lines().join("\n"), "second\nline");
+    // Coming back down leaves the cursor at the end, so down goes on to the draft.
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    assert_eq!(app.input.lines().join("\n"), "draft");
+    // Resending a recalled message is just enter.
+    press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    drain(&mut app, &mut receiver).await;
+    let last_user = app.turns.iter().rev().find(|turn| turn.role == Some(Role::User)).unwrap();
+    assert_eq!(last_user.text, "first");
+}
+
+#[tokio::test]
+async fn shift_up_scrolls_the_transcript() {
+    let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+    press(&mut app, KeyCode::Up, KeyModifiers::SHIFT);
+    assert_eq!(app.scroll, 1);
+    press(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+    assert_eq!(app.scroll, 0);
+}
+
+#[tokio::test]
+async fn transient_failures_are_retried_before_anything_arrives() {
+    let (mut app, mut receiver, provider) = app_with(reply_events(), None);
+    let busy = || sparkle_core::Error::Api { status: 503, message: "busy".into() };
+    provider.failures.lock().unwrap().extend([busy(), busy()]);
+    type_text(&mut app, "hi");
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    let mut saw_retry = false;
+    while app.busy() {
+        let message = receiver.recv().await.unwrap();
+        app.on_stream(message);
+        saw_retry |= app.retrying.is_some();
+    }
+    assert!(saw_retry);
+    assert!(app.retrying.is_none());
+    let reply = app.turns.last().unwrap();
+    assert_eq!((reply.text.as_str(), reply.error.as_ref()), ("Hello **there**", None));
+    assert_eq!(provider.requests.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn permanent_failures_and_exhausted_retries_are_reported() {
+    let (mut app, mut receiver, provider) = app_with(reply_events(), None);
+    let denied = sparkle_core::Error::Api { status: 401, message: "no key".into() };
+    provider.failures.lock().unwrap().push_back(denied);
+    say(&mut app, &mut receiver, "hi").await;
+    assert!(app.turns.last().unwrap().error.as_ref().unwrap().contains("401"));
+    assert_eq!(provider.requests.lock().unwrap().len(), 1, "a 401 is not retried");
+
+    let busy = || sparkle_core::Error::Api { status: 429, message: "slow down".into() };
+    provider.failures.lock().unwrap().extend((0..10).map(|_| busy()));
+    say(&mut app, &mut receiver, "again").await;
+    assert!(app.turns.last().unwrap().error.as_ref().unwrap().contains("429"));
+    assert_eq!(provider.requests.lock().unwrap().len(), 2 + app.max_retries as usize);
+}
+
+#[test]
+fn backoff_doubles_and_is_capped() {
+    let base = Duration::from_secs(1);
+    let first = super::stream::backoff(base, 1);
+    let third = super::stream::backoff(base, 3);
+    assert!(first >= base && first <= base.mul_f64(1.25), "{first:?}");
+    assert!(third >= base * 4 && third <= base.mul_f64(5.0), "{third:?}");
+    assert!(super::stream::backoff(base, 20) <= Duration::from_secs(38));
 }
 
 #[tokio::test]
@@ -1203,4 +1346,101 @@ async fn ctrl_c_during_a_reply_stops_it_without_exiting() {
     assert!(!app.busy());
     assert!(!app.should_quit);
     assert!(!app.exit_pending());
+}
+
+fn with_journal(app: &mut App, name: &str) -> Journal {
+    let path = std::env::temp_dir()
+        .join(format!("sparkle-app-journal-{}-{name}", std::process::id()))
+        .join("journal.jsonl");
+    let journal = Journal::new(path);
+    journal.clear().unwrap();
+    app.journal = Some(journal.clone());
+    app.reopen_journal();
+    journal
+}
+
+fn noting(text: &str) -> Vec<StreamEvent> {
+    vec![StreamEvent::Text(text.into()), StreamEvent::Finished("stop".into())]
+}
+
+#[tokio::test]
+async fn the_model_keeps_notes_without_them_showing_in_the_chat() {
+    let reply = "Nice to meet you, Sam!\n<journal keep=\"always\">Their name is Sam</journal>";
+    let (mut app, mut receiver, provider) = app_with(noting(reply), None);
+    app.system = Some("Be kind".into());
+    let journal = with_journal(&mut app, "keeps");
+    say(&mut app, &mut receiver, "hi, I'm Sam").await;
+
+    let system = &provider.requests.lock().unwrap()[0].messages[0];
+    assert!(system.content.starts_with("Be kind\n\nYou keep a journal"), "{}", system.content);
+    let entries = journal.entries();
+    assert_eq!(entries.len(), 1);
+    assert_eq!((entries[0].text.as_str(), entries[0].until), ("Their name is Sam", None));
+    assert_eq!(entries[0].model.as_deref(), Some("mock"));
+    assert_eq!(app.turns.last().unwrap().journaled, 1);
+    // The model still sees what she wrote, so she knows the note is kept.
+    assert!(app.turns.last().unwrap().text.contains("<journal"));
+    journal.clear().unwrap();
+}
+
+#[tokio::test]
+async fn the_journal_stays_put_during_a_conversation_and_refreshes_on_new() {
+    let (mut app, mut receiver, provider) =
+        app_with(noting("Noted. <journal keep=\"2w\">Likes tea</journal>"), None);
+    let journal = with_journal(&mut app, "stays");
+    say(&mut app, &mut receiver, "I like tea").await;
+    say(&mut app, &mut receiver, "and biscuits").await;
+    {
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests[0].messages[0], requests[1].messages[0], "the opening never changes");
+        assert!(!requests[1].messages[0].content.contains("Likes tea"));
+    }
+    say(&mut app, &mut receiver, "/new").await;
+    say(&mut app, &mut receiver, "hello again").await;
+    let requests = provider.requests.lock().unwrap();
+    let opening = &requests[2].messages[0].content;
+    assert!(opening.contains("\n1. [") && opening.contains("2w left] Likes tea"), "{opening}");
+    assert_eq!(journal.entries().len(), 1, "writing the same note again renews it");
+    journal.clear().unwrap();
+}
+
+#[tokio::test]
+async fn the_model_can_let_a_note_go_by_its_number() {
+    let (mut app, mut receiver, provider) = app_with(Vec::new(), None);
+    let journal = with_journal(&mut app, "forget");
+    let keep = |text: &str| journal::Action::Keep { text: text.into(), keep: None };
+    journal.apply(&[keep("first"), keep("second")], &[], None).unwrap();
+    app.reopen_journal();
+    provider.queue(noting("Sure. <journal forget=\"1\"/>"));
+    say(&mut app, &mut receiver, "forget the first thing").await;
+    let texts: Vec<String> = journal.entries().into_iter().map(|entry| entry.text).collect();
+    assert_eq!(texts, ["second"]);
+    journal.clear().unwrap();
+}
+
+#[tokio::test]
+async fn the_person_can_read_and_clear_the_journal() {
+    let (mut app, mut receiver, _provider) = app_with(Vec::new(), None);
+    say(&mut app, &mut receiver, "/journal").await;
+    assert!(app.notice.as_deref().unwrap().contains("journal is off"));
+
+    let journal = with_journal(&mut app, "read");
+    say(&mut app, &mut receiver, "/journal").await;
+    assert_eq!(app.turns.last().unwrap().text, "The journal is empty");
+    let keep = journal::Action::Keep { text: "Likes tea".into(), keep: Some(86_400 * 7) };
+    journal.apply(&[keep], &[], None).unwrap();
+    say(&mut app, &mut receiver, "/journal").await;
+    let listing = &app.turns.last().unwrap().text;
+    assert!(listing.contains("1 notes") || listing.contains("Journal, 1"), "{listing}");
+    assert!(listing.contains("7d left · Likes tea"), "{listing}");
+    say(&mut app, &mut receiver, "/journal clear").await;
+    assert!(journal.entries().is_empty());
+}
+
+#[tokio::test]
+async fn without_a_journal_the_system_prompt_is_unchanged() {
+    let (mut app, mut receiver, provider) = app_with(reply_events(), None);
+    app.system = Some("Be kind".into());
+    say(&mut app, &mut receiver, "hi").await;
+    assert_eq!(provider.requests.lock().unwrap()[0].messages[0].content, "Be kind");
 }

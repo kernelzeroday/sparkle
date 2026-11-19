@@ -167,11 +167,20 @@ impl Harness {
         .unwrap();
         std::fs::write(home.join("keys.json"), r#"{"mockkey":"sk-test"}"#).unwrap();
         std::fs::write(home.join("default_model.txt"), "mock\n").unwrap();
-        Self { home, requests }
+        let harness = Self { home, requests };
+        harness.write_file("config.toml", "");
+        harness
     }
 
+    /// Writes a file into sparkle's home. Most tests check exact requests, so the chat journal,
+    /// which adds to the system prompt, stays off unless a config names it.
     pub fn write_file(&self, name: &str, contents: &str) -> String {
         let path = self.home.join(name);
+        let contents = if name == "config.toml" && !contents.contains("journal") {
+            format!("journal = false\n{contents}")
+        } else {
+            contents.to_string()
+        };
         std::fs::write(&path, contents).unwrap();
         path.to_str().unwrap().to_string()
     }

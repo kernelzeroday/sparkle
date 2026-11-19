@@ -15,6 +15,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
 use sparkle_core::compact;
 use sparkle_core::context::{self, Fit, estimate_tokens};
+use sparkle_core::journal::{self, Journal, Opening};
 use sparkle_core::library;
 use sparkle_core::prefill::PrefillFilter;
 use sparkle_core::title;
@@ -42,6 +43,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/retry", "Regenerate the last reply"),
     ("/edit", "Edit the last reply in $EDITOR"),
     ("/compact", "Compact earlier messages: /compact [summary|handoff|shake|trim] [FOCUS]"),
+    ("/journal", "Read the model's journal: /journal [clear|path]"),
     ("/quit", "Leave the chat"),
 ];
 
@@ -86,6 +88,12 @@ pub struct ChatSession {
     pub smart_titles: bool,
     /// Warn once a request fills this percentage of the context window.
     pub warn_percent: u8,
+    /// Times to resend a request that failed before any reply arrived.
+    pub retries: u32,
+    /// Where ctrl+t saves whether thinking is shown, for the next run.
+    pub show_thinking_file: Option<PathBuf>,
+    /// The model's journal, when it is on.
+    pub journal: Option<Journal>,
     /// Where the default system prompt is saved. Without one, defaults cannot be changed.
     pub default_prompt_file: Option<PathBuf>,
 }
@@ -111,6 +119,8 @@ pub struct Turn {
     pub summary: bool,
     /// Method and token counts recorded when this turn compacted earlier history.
     pub compaction: Option<CompactionInfo>,
+    /// How many journal notes this reply kept or let go.
+    pub journaled: usize,
     pub cache: Option<(u16, bool, Vec<Line<'static>>)>,
 }
 
@@ -185,9 +195,20 @@ pub(super) struct Compaction {
     pub(super) usage: Option<Usage>,
 }
 
+/// A failed request waiting to be sent again.
+#[derive(Clone, Debug)]
+pub struct Retry {
+    pub attempt: u32,
+    pub max: u32,
+    /// When the next attempt goes out.
+    pub at: Instant,
+    pub reason: String,
+}
+
 #[derive(Debug)]
 pub enum Payload {
     Event(StreamEvent),
+    Retrying(Retry),
     Failed(String),
     Ended,
     Title(String),
@@ -270,6 +291,7 @@ pub struct App {
     /// The saved default system prompt.
     pub default_prompt: Option<String>,
     default_prompt_file: Option<PathBuf>,
+    show_thinking_file: Option<PathBuf>,
     prompt_pack: Option<PathBuf>,
     exit_armed: Option<Instant>,
     /// Transcript height at the last draw, used to hold the view steady while scrolled up.
@@ -283,6 +305,23 @@ pub struct App {
     title_task: Option<JoinHandle<()>>,
     first_reasoning: Option<Instant>,
     compaction: Option<Compaction>,
+    /// The pending retry of a request that failed before producing anything.
+    pub retrying: Option<Retry>,
+    /// The first wait between retries; later waits double.
+    pub retry_base: Duration,
+    pub max_retries: u32,
+    /// Messages typed while busy, sent in order once the reply finishes.
+    pub queued: Vec<String>,
+    /// Everything submitted, oldest first, for recall with up and down.
+    input_history: Vec<String>,
+    /// The entry being shown while moving through `input_history`.
+    history_index: Option<usize>,
+    /// What was typed before moving through the history.
+    history_draft: String,
+    pub journal: Option<Journal>,
+    /// The journal as this conversation opened with it. It is not refreshed mid-conversation,
+    /// so the start of every request stays the same and server prompt caches stay valid.
+    pub journal_opening: Option<Opening>,
     generation: u64,
     task: Option<JoinHandle<()>>,
     sender: UnboundedSender<StreamMessage>,
@@ -330,6 +369,11 @@ impl App {
             turn.stored_id = Some(message.id);
             turns.push(turn);
         }
+        let input_history = turns
+            .iter()
+            .filter(|turn| turn.role == Some(Role::User) && !turn.summary && !turn.text.is_empty())
+            .map(|turn| turn.text.clone())
+            .collect();
         let default_prompt =
             session.default_prompt_file.as_deref().and_then(library::saved_default);
         let app = Self {
@@ -370,6 +414,7 @@ impl App {
             warn_percent: session.warn_percent,
             default_prompt,
             default_prompt_file: session.default_prompt_file,
+            show_thinking_file: session.show_thinking_file,
             prompt_pack: session.model.prompt_pack,
             exit_armed: None,
             last_line_count: 0,
@@ -382,6 +427,15 @@ impl App {
             title_task: None,
             first_reasoning: None,
             compaction: None,
+            retrying: None,
+            retry_base: Duration::from_secs(1),
+            max_retries: session.retries,
+            queued: Vec::new(),
+            input_history,
+            history_index: None,
+            history_draft: String::new(),
+            journal_opening: session.journal.as_ref().map(Journal::opening),
+            journal: session.journal,
             generation: 0,
             task: None,
             sender,
@@ -391,6 +445,11 @@ impl App {
 
     pub fn busy(&self) -> bool {
         self.phase != Phase::Idle
+    }
+
+    /// Whether the screen changes on its own and needs the frame ticker.
+    pub fn animating(&self) -> bool {
+        self.busy() || (self.animations && self.turns.is_empty() && self.picker.is_none())
     }
 
     /// Asks the current provider for its context size in the background.
@@ -431,7 +490,7 @@ impl App {
         pending += self.fragments.iter().map(String::len).sum::<usize>();
         pending += self.prefill.as_ref().map_or(0, String::len);
         if self.measured_context.is_none() {
-            pending += self.system.as_ref().map_or(0, String::len);
+            pending += self.system.as_ref().map_or(0, String::len) + self.journal_len();
         }
         (measured + estimate_tokens(pending), self.measured_context.is_none() || pending > 0)
     }
@@ -442,7 +501,7 @@ impl App {
             self.turns.iter().filter(|turn| turn.role.is_some()).map(Turn::wire_len).sum();
         let fragments: usize = self.fragments.iter().map(String::len).sum();
         let prefill = self.prefill.as_ref().map_or(0, String::len);
-        estimate_tokens(prompt_bytes + turns + fragments + prefill)
+        estimate_tokens(prompt_bytes + self.journal_len() + turns + fragments + prefill)
     }
 
     /// A warning when the next request is close to or beyond the model's context window.
@@ -518,6 +577,11 @@ impl App {
             }
             KeyCode::Char('t') if control => {
                 self.show_reasoning = !self.show_reasoning;
+                if let Some(file) = &self.show_thinking_file
+                    && let Err(error) = sparkle_core::config::save_switch(file, self.show_reasoning)
+                {
+                    self.notice = Some(format!("Could not remember the thinking setting: {error}"));
+                }
             }
             KeyCode::Char('o') if control => {
                 self.show_compaction_summary = !self.show_compaction_summary;
@@ -532,10 +596,29 @@ impl App {
             KeyCode::Enter => self.submit(),
             KeyCode::PageUp => self.scroll = self.scroll.saturating_add(10),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(10),
-            KeyCode::Up if self.input_is_empty() => self.scroll = self.scroll.saturating_add(1),
-            KeyCode::Down if self.input_is_empty() => self.scroll = self.scroll.saturating_sub(1),
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.scroll = self.scroll.saturating_add(1);
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.scroll = self.scroll.saturating_sub(1);
+            }
+            KeyCode::Up if self.input_is_empty() && !self.queued.is_empty() => {
+                // Takes back the latest queued message to change it before it goes.
+                let text = self.queued.pop().unwrap_or_default();
+                self.set_input(&text);
+            }
+            KeyCode::Up if self.input.cursor().0 == 0 => self.recall_older(),
+            KeyCode::Down
+                if self.history_index.is_some()
+                    && self.input.cursor().0 + 1 >= self.input.lines().len() =>
+            {
+                self.recall_newer();
+            }
             _ => {
-                self.input.input(key);
+                if self.input.input(key) {
+                    // Editing a recalled message makes it the new draft.
+                    self.history_index = None;
+                }
             }
         }
     }
@@ -549,6 +632,75 @@ impl App {
     fn set_input(&mut self, text: &str) {
         self.input = new_input(&self.theme);
         self.input.insert_str(text);
+    }
+
+    fn input_text(&self) -> String {
+        self.input.lines().join("\n")
+    }
+
+    /// Remembers a submitted message for recall, skipping an immediate repeat.
+    fn remember_input(&mut self, text: &str) {
+        self.history_index = None;
+        self.history_draft.clear();
+        if self.input_history.last().is_none_or(|last| last != text) {
+            self.input_history.push(text.to_string());
+        }
+    }
+
+    /// Shows the previous submitted message, keeping the draft for the way back down.
+    fn recall_older(&mut self) {
+        let index = match self.history_index {
+            Some(0) => return,
+            Some(index) => index - 1,
+            None if self.input_history.is_empty() => return,
+            None => {
+                self.history_draft = self.input_text();
+                self.input_history.len() - 1
+            }
+        };
+        self.history_index = Some(index);
+        let text = self.input_history[index].clone();
+        self.set_input(&text);
+        // From the top of a long entry, the next up goes straight to the one before it.
+        self.input.move_cursor(ratatui_textarea::CursorMove::Top);
+        self.input.move_cursor(ratatui_textarea::CursorMove::Head);
+    }
+
+    /// Shows the next submitted message, then the draft once past the newest.
+    fn recall_newer(&mut self) {
+        let Some(index) = self.history_index else { return };
+        if index + 1 < self.input_history.len() {
+            self.history_index = Some(index + 1);
+            let text = self.input_history[index + 1].clone();
+            self.set_input(&text);
+        } else {
+            self.history_index = None;
+            let draft = std::mem::take(&mut self.history_draft);
+            self.set_input(&draft);
+        }
+    }
+
+    /// Sends queued messages in order until one starts a reply.
+    fn run_queued(&mut self) {
+        while !self.busy() && !self.queued.is_empty() {
+            let text = self.queued.remove(0);
+            self.dispatch(text);
+        }
+    }
+
+    /// Puts queued messages back in the input after a reply stops early, so nothing is sent
+    /// on top of a failure the user has not seen.
+    fn restore_queued(&mut self) {
+        if self.queued.is_empty() {
+            return;
+        }
+        let mut parts = std::mem::take(&mut self.queued);
+        let current = self.input_text();
+        if !current.trim().is_empty() {
+            parts.push(current);
+        }
+        self.set_input(&parts.join("\n\n"));
+        self.notice = Some("Queued messages are back in the input".into());
     }
 
     /// Completes a unique match, extends a shared prefix, then cycles through the matches.
@@ -750,12 +902,48 @@ impl App {
         messages
     }
 
+    fn journal_len(&self) -> usize {
+        self.journal_opening.as_ref().map_or(0, |opening| opening.text.len() + 2)
+    }
+
+    /// The system prompt as the model receives it, with the journal after it.
+    fn wire_system(&self) -> Option<String> {
+        let journal = self.journal_opening.as_ref().map(|opening| opening.text.as_str());
+        match (&self.system, journal) {
+            (Some(system), Some(journal)) => Some(format!("{system}\n\n{journal}")),
+            (Some(system), None) => Some(system.clone()),
+            (None, journal) => journal.map(str::to_string),
+        }
+    }
+
+    /// Opens the journal afresh for a new conversation.
+    pub(super) fn reopen_journal(&mut self) {
+        self.journal_opening = self.journal.as_ref().map(Journal::opening);
+    }
+
+    /// Keeps the notes the model wrote in a finished reply, and counts them on the reply.
+    pub(super) fn keep_journal_notes(&mut self) {
+        let (Some(journal), Some(turn)) = (&self.journal, self.turns.last_mut()) else { return };
+        let actions = journal::actions(&turn.text);
+        if actions.is_empty() {
+            return;
+        }
+        let numbered = self.journal_opening.as_ref().map_or(&[][..], |opening| &opening.ids);
+        match journal.apply(&actions, numbered, Some(&turn.model)) {
+            Ok(count) => {
+                turn.journaled = count;
+                turn.cache = None;
+            }
+            Err(error) => self.notice = Some(format!("Could not save to the journal: {error}")),
+        }
+    }
+
     /// The system prompt followed by the active slice of `turns` (starting at the latest
     /// compaction boundary, if any), as the model receives them.
     fn wire_messages(&self, turns: &[Turn]) -> Vec<Message> {
         let mut messages = Vec::new();
-        if let Some(system) = &self.system {
-            messages.push(Message::new(Role::System, system.clone()));
+        if let Some(system) = self.wire_system() {
+            messages.push(Message::new(Role::System, system));
         }
         let start = turns.iter().rposition(|turn| turn.summary).unwrap_or(0);
         for turn in &turns[start..] {

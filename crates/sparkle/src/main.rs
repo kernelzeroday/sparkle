@@ -38,9 +38,13 @@ struct RunContext {
     history: Vec<StoredMessage>,
 }
 
-/// Thinking is shown unless `-R` or `show_thinking = false` says otherwise.
-fn thinking_hidden(hide_flag: bool, registry: &Registry) -> bool {
-    hide_flag || !registry.settings.show_thinking.unwrap_or(true)
+/// Thinking is hidden for one run by `-R`; otherwise the last ctrl+t choice in the chat wins,
+/// then `show_thinking` in the config, then showing it.
+fn thinking_hidden(hide_flag: bool, context: &RunContext) -> bool {
+    let shown = sparkle_core::config::saved_switch(&context.paths.show_thinking())
+        .or(context.registry.settings.show_thinking)
+        .unwrap_or(true);
+    hide_flag || !shown
 }
 
 fn parse_options(args: &ModelArgs, registry: &Registry) -> Options {
@@ -339,7 +343,7 @@ async fn run_prompt(args: PromptArgs) -> Result<()> {
     warn_about_context(&context, &request.messages).await;
 
     let buffered = args.json || args.extract || args.extract_last;
-    let hide_reasoning = args.json || thinking_hidden(args.hide_reasoning, &context.registry);
+    let hide_reasoning = args.json || thinking_hidden(args.hide_reasoning, &context);
     let render = RenderOptions { hide_reasoning, prefill: prefill.as_deref(), buffered };
     let prefix = prefill.as_deref().unwrap_or("");
     if !buffered && !prefix.is_empty() {
@@ -397,7 +401,9 @@ async fn run_chat(args: ChatArgs) -> Result<()> {
     let default_prompt_file = Some(context.paths.default_prompt());
     let paths = context.paths.clone();
     let prompt_pack = Some(pack_for(&paths, &context.model));
-    let show_reasoning = !thinking_hidden(args.hide_reasoning, &context.registry);
+    let show_reasoning = !thinking_hidden(args.hide_reasoning, &context);
+    let show_thinking_file = Some(context.paths.show_thinking());
+    let journal_file = context.paths.journal();
     let title = match &context.conversation_id {
         Some(id) => context.store.conversation_title(id)?,
         None => None,
@@ -434,6 +440,12 @@ async fn run_chat(args: ChatArgs) -> Result<()> {
         title,
         smart_titles: settings.smart_titles.unwrap_or(true),
         warn_percent: settings.warn_percent(),
+        retries: settings.retries.unwrap_or(5),
+        show_thinking_file,
+        journal: settings
+            .journal
+            .unwrap_or(true)
+            .then(|| sparkle_core::journal::Journal::new(journal_file)),
         default_prompt_file,
     };
     if let Some(conversation) = sparkle_tui::run(session).await? {
@@ -506,7 +518,7 @@ async fn run_plain_chat(mut context: RunContext, args: &ChatArgs) -> Result<()> 
         let prefix = prefill.clone().unwrap_or_default();
         print!("{prefix}");
         std::io::stdout().flush()?;
-        let hide_reasoning = thinking_hidden(args.hide_reasoning, &context.registry);
+        let hide_reasoning = thinking_hidden(args.hide_reasoning, &context);
         let render = RenderOptions { hide_reasoning, prefill: Some(&prefix), buffered: false };
         match plain::stream_reply(context.provider.as_ref(), &request, render).await {
             Ok(outcome) => {

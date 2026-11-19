@@ -61,6 +61,9 @@ fn reply_stats(turn: &Turn) -> String {
     if let Some(duration) = turn.duration_ms {
         parts.push(seconds(duration));
     }
+    if turn.journaled > 0 {
+        parts.push("✎ noted".to_string());
+    }
     parts.join(" · ")
 }
 
@@ -175,7 +178,9 @@ fn render_turn(
                 }
                 lines.push(Line::default());
             }
-            lines.extend(markdown::render(&turn.text, width, theme, icons));
+            // Journal notes are for the model; the person reads them with /journal if they like.
+            let shown = sparkle_core::journal::strip(&turn.text);
+            lines.extend(markdown::render(&shown, width, theme, icons));
             if turn.interrupted {
                 lines.push(Line::from(Span::styled(
                     format!("{} Stopped", icons.stopped),
@@ -217,6 +222,13 @@ fn session_details(app: &App) -> Vec<String> {
     if let Some(prefill) = &app.prefill {
         details.push(format!("Prefill: {}", size_label(prefill.len())));
     }
+    if let Some(opening) = &app.journal_opening {
+        details.push(match opening.ids.len() {
+            0 => "Journal: on".to_string(),
+            1 => "Journal: 1 note".to_string(),
+            count => format!("Journal: {count} notes"),
+        });
+    }
     if let Some(window) = app.context_window {
         details.push(format!("Context window: {} tokens", compact_count(window)));
     }
@@ -247,10 +259,57 @@ fn draw_welcome(frame: &mut Frame<'_>, area: Rect, app: &App) {
     for detail in details {
         lines.push(Line::from(Span::styled(detail, Style::new().fg(theme.heading))));
     }
+    // The biggest sparkle that leaves the text room; none on a cramped screen.
+    let text_height = lines.len() as u16;
+    let ascii = app.icons.assistant.is_ascii();
+    let radius = [11u16, 7, 4].into_iter().find(|&radius| {
+        let fits_width = radius * 2 + 9 <= area.width;
+        fits_width && text_height + anim::sparkle_height(radius) < area.height
+    });
+    if let Some(radius) = radius {
+        let low = anim::rgb(theme.accent, theme.shimmer_low);
+        let frame_number = if app.animations { app.frame } else { 0 };
+        let mut art = anim::sparkle(radius, frame_number, ascii, low, theme.shimmer_high);
+        art.push(Line::default());
+        art.append(&mut lines);
+        lines = art;
+    }
     let height = lines.len() as u16;
     let top = area.y + area.height.saturating_sub(height) / 2;
     let centered = Rect { y: top, height: height.min(area.height), ..area };
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), centered);
+}
+
+/// How many queued messages are listed above the activity line before the rest are counted.
+const QUEUE_SHOWN: usize = 3;
+
+fn queue_rows(app: &App) -> u16 {
+    match app.queued.len() {
+        0 => 0,
+        count => count.min(QUEUE_SHOWN) as u16 + u16::from(count > QUEUE_SHOWN),
+    }
+}
+
+/// Messages waiting for the reply to finish, newest last, one line each.
+fn queue_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let theme = &app.theme;
+    let room = usize::from(width).saturating_sub(12);
+    let skipped = app.queued.len().saturating_sub(QUEUE_SHOWN);
+    let mut lines = Vec::new();
+    if skipped > 0 {
+        let more = format!("   … {skipped} more queued");
+        lines.push(Line::from(Span::styled(more, Style::new().fg(theme.faint))));
+    }
+    for (index, text) in app.queued.iter().enumerate().skip(skipped) {
+        let first = text.lines().next().unwrap_or("");
+        let shown = fit_width(first, room);
+        let label = if index + 1 == app.queued.len() { "queued ↑" } else { "queued  " };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {label} "), Style::new().fg(theme.faint)),
+            Span::styled(shown, Style::new().fg(theme.muted)),
+        ]));
+    }
+    lines
 }
 
 fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -298,7 +357,12 @@ fn activity_line(app: &App) -> Line<'static> {
         return Line::from(Span::styled(format!(" {notice}"), Style::new().fg(theme.heading)));
     }
     if app.busy() {
+        let retry = app.retrying.as_ref().map(|retry| {
+            let wait = retry.at.saturating_duration_since(std::time::Instant::now());
+            format!("Retrying in {}s ({}/{})", wait.as_secs() + 1, retry.attempt, retry.max)
+        });
         let label = match (app.phase, app.prompt_progress) {
+            _ if retry.is_some() => retry.clone().unwrap_or_default(),
             (Phase::Compacting, Some(progress)) => format!("Compacting: {}", progress.label()),
             (Phase::Compacting, None) => "Compacting".to_string(),
             (Phase::Waiting, Some(progress)) => progress.label(),
@@ -321,6 +385,9 @@ fn activity_line(app: &App) -> Line<'static> {
         if app.phase == Phase::Thinking {
             let reasoning = app.turns.last().map_or(0, |turn| turn.reasoning.len());
             detail.push_str(&format!(" · ~{} tokens", reasoning / 4));
+        }
+        if let Some(retry) = &app.retrying {
+            detail = format!("  {}", fit_width(&retry.reason, 60));
         }
         detail.push_str(" · esc to stop");
         spans.push(Span::styled(detail, muted));
@@ -443,8 +510,9 @@ fn input_rows(input: &TextArea<'_>, width: u16) -> u16 {
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let input_lines = input_rows(&app.input, frame.area().width);
-    let [transcript, activity, input, status] = Layout::vertical([
+    let [transcript, queue, activity, input, status] = Layout::vertical([
         Constraint::Min(1),
+        Constraint::Length(queue_rows(app)),
         Constraint::Length(1),
         Constraint::Length(input_lines + 2),
         Constraint::Length(1),
@@ -452,6 +520,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     .areas(frame.area());
 
     draw_transcript(frame, transcript, app);
+    frame.render_widget(Paragraph::new(queue_lines(app, queue.width)), queue);
     frame.render_widget(Paragraph::new(activity_line(app)), activity);
     frame.render_widget(&app.input, input);
     frame.render_widget(Paragraph::new(status_line(app, status.width)), status);
@@ -1011,6 +1080,52 @@ mod tests {
         assert!(wide.trim_end().ends_with("8/1k (0%) · 5 in · 3 out"), "{wide}");
         let narrow = text(&status_line(&app, 30));
         assert!(narrow.trim_end().ends_with("8/1k (0%)"), "{narrow}");
+    }
+
+    #[tokio::test]
+    async fn welcome_screen_draws_a_sparkle_that_twinkles_when_there_is_room() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        assert!(app.animating(), "the welcome screen keeps the ticker running");
+        let first = screen(&mut app, 80, 30);
+        assert!(first.contains('#') && first.contains("Chatting with mock"), "{first}");
+        app.frame = 17;
+        assert_ne!(screen(&mut app, 80, 30), first);
+        let cramped = screen(&mut app, 80, 9);
+        assert!(!cramped.contains('#') && cramped.contains("Chatting with mock"), "{cramped}");
+        app.animations = false;
+        assert!(!app.animating());
+    }
+
+    #[tokio::test]
+    async fn queued_messages_are_listed_above_the_input() {
+        let (mut app, _receiver, _provider) = app_with(Vec::new(), None);
+        app.queued = (1..=5).map(|number| format!("message {number}\nmore")).collect();
+        let screen = screen(&mut app, 80, 24);
+        assert!(screen.contains("… 2 more queued"), "{screen}");
+        assert!(screen.contains("queued ↑ message 5"), "{screen}");
+        assert!(!screen.contains("message 2") && !screen.contains("more\n"), "{screen}");
+    }
+
+    #[tokio::test]
+    async fn journal_tags_are_hidden_and_the_reply_is_marked() {
+        let reply = "Glad to help.\n\n<journal keep=\"3w\">Working on a parser</journal>\n\nAnything else?";
+        let events = vec![StreamEvent::Text(reply.into()), StreamEvent::Finished("stop".into())];
+        let (mut app, mut receiver, _provider) = app_with(events, None);
+        let path = std::env::temp_dir().join(format!("sparkle-view-journal-{}", std::process::id()));
+        let journal = sparkle_core::journal::Journal::new(path.join("journal.jsonl"));
+        journal.clear().unwrap();
+        app.journal = Some(journal.clone());
+        app.journal_opening = Some(journal.opening());
+        let welcome = screen(&mut app, 80, 30);
+        assert!(welcome.contains("Journal: on"), "{welcome}");
+        type_text(&mut app, "thanks");
+        enter(&mut app);
+        drain(&mut app, &mut receiver).await;
+        let screen = screen(&mut app, 80, 24);
+        assert!(screen.contains("Glad to help.") && screen.contains("Anything else?"), "{screen}");
+        assert!(!screen.contains("journal") && !screen.contains("parser"), "{screen}");
+        assert!(screen.contains("✎ noted"), "{screen}");
+        journal.clear().unwrap();
     }
 
     #[tokio::test]

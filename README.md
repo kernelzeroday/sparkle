@@ -40,25 +40,41 @@ Replies go to stdout. Reasoning and animation go to stderr, so pipes receive onl
 
 | Key | Action |
 | --- | --- |
-| `enter` | Send |
+| `enter` | Send, or queue the message while a reply is running |
 | `shift+enter`, `ctrl+j` | New line |
 | `esc` | Stop the reply |
 | `tab` | Complete a `/command`, press again to cycle |
 | `ctrl+t` | Show or hide thinking |
 | `ctrl+o` | Show or hide compaction summaries |
 | `shift+tab` | Cycle reasoning effort |
-| `pgup`, `pgdn` | Scroll |
+| `up`, `down` | Recall sent messages; `up` on an empty input takes back a queued one |
+| `pgup`, `pgdn`, `shift+up`, `shift+down` | Scroll |
 | `ctrl+c` | Stop the reply, or clear the input |
 | `ctrl+c` or `ctrl+d` twice | Exit, when the input is empty |
 
 Commands: `/help`, `/new`, `/model`, `/effort`, `/persona`, `/prompts`, `/system`, `/prefill`,
-`/retry`, `/edit`, `/compact`, `/quit`.
+`/retry`, `/edit`, `/compact`, `/journal`, `/quit`.
 
 `/compact [summary|handoff|shake|trim] [FOCUS]` inserts an inline compaction divider to free
 context while keeping earlier messages visible in the scrollback (press `ctrl+o` to expand or
 collapse the summary). `summary` (default) and `handoff` ask the model to condense earlier turns;
 `shake` elides large code blocks locally without a model call; `trim [N]` drops older turns locally
 and keeps the latest `N` messages.
+
+### The journal
+
+In the chat, the model keeps a journal: short notes about you that she chooses to carry from one
+conversation to the next. Writing is up to her and costs nothing extra. She writes a tag anywhere
+in a reply, `<journal keep="3w">…</journal>`, which is saved and hidden from the transcript; a
+faint `✎ noted` marks the reply. She decides how long each note lasts (`5d`, `3w`, `6m`, `1y` or
+`always`, 30 days by default), notes fade when their time is up, and `<journal forget="N"/>`
+lets one go early.
+
+The notes still in force reach her once, with the system prompt, when a conversation opens, framed
+as background she need not mention or tend to. They are not refreshed mid-conversation, which keeps
+server prompt caches valid, and they are capped at about 750 tokens. `/journal` shows the notes,
+`/journal clear` empties it, and `journal = false` in the config turns it off. One-shot prompts and
+`--plain` chats never see it.
 
 ## System prompts
 
@@ -120,9 +136,12 @@ persona = "concise"
 theme = "dusk"       # dusk or paper
 icons = "auto"       # auto, nerd, unicode or ascii
 animations = true
-show_thinking = true # show reasoning as it arrives; -R hides it for one run
+show_thinking = true # show reasoning as it arrives; ctrl+t in a chat overrides this
+                     # and is remembered, while -R hides it for one run
 smart_titles = true  # let the model name each new chat
 context_warn_percent = 80 # warn when a request fills this much of the context window
+retries = 5          # resend a failed request this many times, backing off 1s, 2s, 4s…
+journal = true       # let the chat model keep a journal about you (see above)
 
 [[models]]
 id = "local"

@@ -13,7 +13,8 @@ fn contents(body: &Value) -> Vec<String> {
 }
 
 fn no_smart_titles(harness: &Harness) {
-    harness.write_file("config.toml", "smart_titles = false\n");
+    // Mock failures are permanent, so waiting to retry them only slows the tests down.
+    harness.write_file("config.toml", "smart_titles = false\nretries = 0\n");
 }
 
 #[test]
@@ -158,6 +159,52 @@ fn show_thinking_setting_collapses_thinking() {
     tui.quit();
 }
 
+#[test]
+fn hiding_thinking_with_ctrl_t_is_remembered_for_the_next_chat() {
+    let harness = Harness::new();
+    // The saved choice wins over the config, which only sets the starting point.
+    harness.write_file("config.toml", "show_thinking = true\n");
+    let mut tui = Tui::open(&harness, &[]);
+    tui.send("\x14");
+    tui.quit();
+
+    let mut next = Tui::open(&harness, &[]);
+    next.ask(&harness, "hello");
+    next.wait_for("Hello world");
+    assert!(!next.screen().contains("│ Thinking hard"), "{}", next.screen());
+    next.send("\x14");
+    next.wait_for("│ Thinking hard");
+    next.quit();
+
+    let mut third = Tui::open(&harness, &[]);
+    third.ask(&harness, "hello");
+    third.wait_for("│ Thinking hard");
+    third.quit();
+}
+
+#[test]
+fn the_chat_gives_the_model_a_journal_but_one_shot_prompts_do_not() {
+    let harness = Harness::new();
+    harness.write_file("config.toml", "journal = true\n");
+    let mut tui = Tui::open(&harness, &["--system", "Be brief"]);
+    tui.wait_for("Journal: on");
+    tui.ask(&harness, "hello");
+    tui.wait_for("Hello world");
+    let system = harness.last_body()["messages"][0]["content"].as_str().unwrap().to_string();
+    assert!(system.starts_with("Be brief\n\nYou keep a journal"), "{system}");
+    tui.quit();
+
+    assert!(harness.run(&["--system", "Be brief", "hello"]).status.success());
+    assert_eq!(harness.last_body()["messages"][0]["content"], "Be brief");
+
+    harness.write_file("config.toml", "journal = false\n");
+    let mut off = Tui::open(&harness, &["--system", "Be brief"]);
+    off.ask(&harness, "hello");
+    off.wait_for("Hello world");
+    assert_eq!(harness.last_body()["messages"][0]["content"], "Be brief");
+    off.quit();
+}
+
 // Leaving the chat
 
 #[test]
@@ -239,6 +286,7 @@ fn ctrl_c_stops_a_reply_without_exiting() {
 #[test]
 fn server_errors_stay_in_the_chat_and_the_next_message_works() {
     let harness = Harness::new();
+    no_smart_titles(&harness);
     let mut tui = Tui::open(&harness, &[]);
     tui.ask(&harness, "http500");
     tui.wait_for("mock exploded");
