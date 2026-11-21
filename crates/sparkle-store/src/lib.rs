@@ -181,6 +181,21 @@ impl Store {
         Ok(id)
     }
 
+    /// Removes a conversation. The cascades on `conversation_id` and `message_id` take its
+    /// messages and their attachments with it. Returns whether it existed.
+    pub fn delete_conversation(&self, conversation_id: &str) -> Result<bool> {
+        let removed = self
+            .connection
+            .execute("DELETE FROM conversations WHERE id = ?1", [conversation_id])?;
+        Ok(removed > 0)
+    }
+
+    /// Removes every conversation along with everything stored in it. Returns how many there
+    /// were.
+    pub fn delete_all_conversations(&self) -> Result<usize> {
+        Ok(self.connection.execute("DELETE FROM conversations", [])?)
+    }
+
     /// Appends a message and makes it the conversation's current tip.
     pub fn append(&self, conversation_id: &str, message: NewMessage<'_>) -> Result<String> {
         let transaction = self.connection.unchecked_transaction()?;
@@ -566,5 +581,51 @@ mod tests {
 
         let active: Vec<_> = active_context(&thread).iter().map(|m| m.content.as_str()).collect();
         assert_eq!(active, ["summary", "next"]);
+    }
+
+    #[test]
+    fn removing_a_conversation_takes_its_messages_and_attachments() {
+        let store = Store::in_memory().unwrap();
+        let (conversation, system, _tip) = exchange(&store);
+        let attachments = vec![Attachment::Url("https://example.com/a.png".into())];
+        let message = NewMessage {
+            attachments: &attachments,
+            ..NewMessage::plain(Some(&system), Role::User, "with a file")
+        };
+        store.append(&conversation, message).unwrap();
+
+        assert!(store.delete_conversation(&conversation).unwrap());
+        assert!(!store.delete_conversation(&conversation).unwrap(), "gone on the second pass");
+        assert!(store.recent(10).unwrap().is_empty());
+        let messages: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        let attachments: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM message_attachments", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((messages, attachments), (0, 0));
+    }
+
+    #[test]
+    fn removing_one_conversation_leaves_the_others() {
+        let store = Store::in_memory().unwrap();
+        let (kept, _, _) = exchange(&store);
+        let (gone, _, _) = exchange(&store);
+        assert!(store.delete_conversation(&gone).unwrap());
+        let recent = store.recent(10).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].id, kept);
+    }
+
+    #[test]
+    fn removing_everything_reports_how_many_went() {
+        let store = Store::in_memory().unwrap();
+        exchange(&store);
+        exchange(&store);
+        assert_eq!(store.delete_all_conversations().unwrap(), 2);
+        assert!(store.recent(10).unwrap().is_empty());
+        assert_eq!(store.delete_all_conversations().unwrap(), 0);
     }
 }

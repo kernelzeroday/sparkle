@@ -33,7 +33,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Show recent conversations
+    /// Show recent conversations, or remove them
     Logs {
         /// Number of conversations to show, or 0 for all
         #[arg(short = 'n', long, default_value_t = 10)]
@@ -41,6 +41,8 @@ pub enum Command {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        #[command(subcommand)]
+        action: Option<LogsAction>,
     },
     /// List built-in personas
     Personas,
@@ -77,6 +79,17 @@ pub enum PromptsAction {
         /// Library prompt, persona or file, or `off` to remove the default
         name: Option<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LogsAction {
+    /// Remove a conversation and all of its messages
+    Remove {
+        /// Conversation id from `sparkle logs`
+        id: String,
+    },
+    /// Remove every conversation
+    Clear,
 }
 
 #[derive(Debug, Args)]

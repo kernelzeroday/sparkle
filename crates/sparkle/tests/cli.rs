@@ -393,6 +393,34 @@ fn logs_list_conversations_newest_first() {
 }
 
 #[test]
+fn logs_remove_deletes_one_conversation_and_clear_deletes_all() {
+    let harness = Harness::new();
+    for prompt in ["alpha", "beta", "gamma"] {
+        harness.run(&["-R", prompt]);
+        std::thread::sleep(std::time::Duration::from_millis(3));
+    }
+    let rows: Value = serde_json::from_str(&stdout(&harness.run(&["logs", "--json"]))).unwrap();
+    let gamma = rows[0]["id"].as_str().unwrap().to_string();
+
+    let out = harness.run(&["logs", "remove", gamma.as_str()]);
+    assert!(out.status.success(), "remove failed: {}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), format!("Removed conversation {gamma}"));
+    let rows: Value = serde_json::from_str(&stdout(&harness.run(&["logs", "--json"]))).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 2);
+
+    // An unknown id fails and leaves the rest untouched.
+    let out = harness.run(&["logs", "remove", "not-a-conversation"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("not-a-conversation"));
+    let rows: Value = serde_json::from_str(&stdout(&harness.run(&["logs", "--json"]))).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 2);
+
+    let out = harness.run(&["logs", "clear"]);
+    assert_eq!(stdout(&out).trim(), "Removed 2 conversations");
+    assert_eq!(stdout(&harness.run(&["logs"])), "");
+}
+
+#[test]
 fn models_can_be_listed_as_json() {
     let harness = Harness::new();
     let rows: Value = serde_json::from_str(&stdout(&harness.run(&["models", "--json"]))).unwrap();

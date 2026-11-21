@@ -15,7 +15,7 @@ use sparkle_store::{NewMessage, Store, StoredMessage};
 use sparkle_tui::{ChatSession, Icons, ResolvedModel, Theme};
 use serde_json::{Value, json};
 
-use cli::{ChatArgs, Cli, Command, ModelArgs, PromptArgs, PromptsAction};
+use cli::{ChatArgs, Cli, Command, LogsAction, ModelArgs, PromptArgs, PromptsAction};
 use plain::{Outcome, RenderOptions};
 
 /// Requests smaller than this cannot trouble a context window, so its size is not looked up.
@@ -671,6 +671,29 @@ fn show_logs(count: usize, json_output: bool) -> Result<()> {
     Ok(())
 }
 
+fn remove_log(id: &str) -> Result<()> {
+    let paths = Paths::discover()?;
+    let store = Store::open(&paths.database())?;
+    if store.delete_conversation(id)? {
+        println!("Removed conversation {id}");
+    } else {
+        bail!("No conversation with id {id}");
+    }
+    Ok(())
+}
+
+fn clear_logs() -> Result<()> {
+    let paths = Paths::discover()?;
+    let store = Store::open(&paths.database())?;
+    let count = store.delete_all_conversations()?;
+    if count == 0 {
+        println!("No conversations to remove");
+    } else {
+        println!("Removed {count} conversations");
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Exit quietly when a reader such as `head` closes the pipe, like other command-line tools.
@@ -682,7 +705,11 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Command::Chat(args)) => run_chat(*args).await,
         Some(Command::Models { json }) => list_models(json),
-        Some(Command::Logs { count, json }) => show_logs(count, json),
+        Some(Command::Logs { count, json, action }) => match action {
+            Some(LogsAction::Remove { id }) => remove_log(&id),
+            Some(LogsAction::Clear) => clear_logs(),
+            None => show_logs(count, json),
+        },
         Some(Command::Personas) => {
             for persona in personas::PERSONAS {
                 println!("{:<10} {}", persona.name, persona.summary);
